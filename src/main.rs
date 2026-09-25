@@ -1,63 +1,30 @@
-use std::fs;
-
-use rand::RngExt;
-use reqwest::Response;
-use serde_bytes::ByteBuf;
-use sha1::{Digest, Sha1};
-use tokio::net::TcpListener;
+mod peer;
+mod peer_message;
 mod torrent;
 mod torrent_info;
-use crate::torrent::Torrent;
-use crate::torrent_info::{get_info_bytes, get_info_length};
-use serde::Deserialize;
+mod tracker;
 
-const CHARACTERS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-
-struct TrackerRequest {
-    info_hash: [u8; 20],
-    peer_id: [u8; 20],
-    port: u16,
-    uploaded: u64,
-    downloaded: u64,
-    left: u64,
-    compact: u8,
-    event: Option<AnnounceEvent>,
-    tracker_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TrackerResponse {
-    interval: Option<u64>,
-    peers: Option<ByteBuf>,
-
-    #[serde(rename = "failure reason")]
-    failure_reason: Option<String>,
-
-    #[serde(rename = "tracker id")]
-    tracker_id: Option<String>,
-}
-impl AnnounceEvent {
-    fn as_str(&self) -> &'static str {
-        match self {
-            AnnounceEvent::Started => "started",
-            AnnounceEvent::Completed => "completed",
-            AnnounceEvent::Stopped => "stopped",
-        }
-    }
-}
-
-#[derive(Debug)]
-enum AnnounceEvent {
-    Started,
-    Completed,
-    Stopped,
-}
+use crate::peer::{build_handshake, connect_to_peer, create_pieces, peer_loop};
+use crate::torrent::{Info, SingleFile, Torrent};
+use crate::torrent_info::get_info_bytes;
+use crate::tracker::{TrackerResponse, announce_to_tracker, build_initial_tracker_request, build_url, parse_compact_peers};
+use std::{fs, io};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 #[tokio::main]
 async fn main() {
     let bytes = fs::read("ubuntu-24.04.4-desktop-arm64.iso.torrent").expect("no se pudo leer el archivo .torrent");
 
     let torrent: Torrent = serde_bencode::from_bytes(&bytes).expect("no se pudo decodificar el torrent");
+
+    let single_file: SingleFile = match torrent.info {
+        Info::SingleFile(file) => file,
+        Info::MultiFile(_) => {
+            eprintln!("los torrents de varios archivos todavia no estan soportados");
+            return;
+        }
+    };
 
     let announce = torrent.announce.as_deref().expect("el torrent no contiene announce");
 
@@ -67,7 +34,7 @@ async fn main() {
 
     let info_bytes = get_info_bytes(&bytes).expect("no se pudieron extraer los bytes de info");
 
-    let total_length = get_info_length(&torrent.info);
+    let total_length = single_file.length;
 
     let listener = TcpListener::bind("0.0.0.0:0").await.expect("no se pudo abrir un puerto tcp");
 
@@ -77,81 +44,108 @@ async fn main() {
 
     let url = build_url(announce, &tracker_request);
 
-    println!("url del tracker: {url}");
+    println!("url del rastreador: {url}");
 
     let response_bytes = announce_to_tracker(&url).await.expect("fallo la solicitud al tracker");
 
     let tracker_response: TrackerResponse = serde_bencode::from_bytes(&response_bytes).expect("respuesta bencode invalida");
 
-    println!("{tracker_response:#?}");
-}
+    let peers_bytes = tracker_response.peers.expect("no existen peers");
 
-async fn announce_to_tracker(url: &str) -> Result<Vec<u8>, String> {
-    let response = reqwest::get(url).await.map_err(|error| error.to_string())?;
+    let peers = parse_compact_peers(peers_bytes.as_ref()).expect("lista compacta de peers invalida");
 
-    let status = response.status();
+    let mut stream: Option<TcpStream> = None;
 
-    let bytes = response.bytes().await.map_err(|error| error.to_string())?;
-
-    if !status.is_success() {
-        return Err(format!("el tracker respondio con http {status}"));
+    for peer in peers {
+        match connect_to_peer(peer).await {
+            Ok(connected_stream) => {
+                println!("conectado al par {peer}");
+                stream = Some(connected_stream);
+                break;
+            }
+            Err(err) if err.kind() == io::ErrorKind::ConnectionRefused => {
+                eprintln!("el par {peer} rechazo la conexion");
+            }
+            Err(err) if err.kind() == io::ErrorKind::TimedOut => {
+                eprintln!("la conexion a {peer} supero los 2 segundos");
+            }
+            Err(err) => {
+                eprintln!("no se pudo conectar a {peer}: {err}");
+            }
+        }
     }
 
-    Ok(bytes.to_vec())
-}
-
-fn build_url(announce: &str, tracker_request: &TrackerRequest) -> String {
-    let info_hash = percent_encode(&tracker_request.info_hash);
-
-    let peer_id = percent_encode(&tracker_request.peer_id);
-
-    let separator = if announce.ends_with('?') || announce.ends_with('&') {
-        ""
-    } else if announce.contains('?') {
-        "&"
-    } else {
-        "?"
+    let Some(mut stream) = stream else {
+        eprintln!("no se pudo conectar con ningun par");
+        return;
     };
 
-    let mut url = format!(
-        "{}{}info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}&compact={}",
-        announce, separator, info_hash, peer_id, tracker_request.port, tracker_request.uploaded, tracker_request.downloaded, tracker_request.left, tracker_request.compact,
-    );
+    let handshake_bytes = build_handshake(tracker_request.info_hash, tracker_request.peer_id);
 
-    if let Some(event) = &tracker_request.event {
-        url.push_str("&event=");
-        url.push_str(event.as_str());
+    match stream.write_all(&handshake_bytes).await {
+        Ok(()) => {
+            println!("saludo inicial enviado correctamente");
+        }
+        Err(err) => {
+            eprintln!("no se pudo enviar el saludo inicial: {err}");
+            return;
+        }
+    }
+    let mut buf = [0u8; 68];
+    match stream.read_exact(&mut buf).await {
+        Ok(_) => {
+            println!("saludo inicial recibido correctamente");
+        }
+        Err(err) => {
+            eprintln!("no se pudo leer el saludo inicial: {err}");
+            return;
+        }
     }
 
-    if let Some(tracker_id) = &tracker_request.tracker_id {
-        url.push_str("&trackerid=");
-        url.push_str(&percent_encode(tracker_id.as_bytes()));
+    if buf[0] != 19 {
+        eprintln!("longitud del protocolo invalida: {}", buf[0]);
+        return;
     }
 
-    url
-}
-
-fn percent_encode(bytes: &[u8]) -> String {
-    let mut resultado = String::new();
-
-    for byte in bytes {
-        resultado.push_str(&format!("%{:02X}", byte));
+    if &buf[1..20] != b"BitTorrent protocol" {
+        eprintln!("el par no utiliza el protocolo bittorrent");
+        return;
     }
 
-    resultado
-}
-fn build_initial_tracker_request(info_bytes: &[u8], port: u16, length: u64) -> TrackerRequest {
-    let mut hasher = Sha1::new();
-    hasher.update(info_bytes);
+    let received_info_hash = &buf[28..48];
 
-    let info_hash: [u8; 20] = hasher.finalize().into();
+    if received_info_hash != tracker_request.info_hash.as_slice() {
+        eprintln!("el hash de informacion recibido no coincide");
+        return;
+    }
 
-    let mut rng = rand::rng();
+    let peer_id = &buf[48..68];
 
-    let peer_id: [u8; 20] = std::array::from_fn(|_| {
-        let position = rng.random_range(0..CHARACTERS.len());
-        CHARACTERS[position]
-    });
+    println!("saludo inicial del par validado correctamente");
+    println!("identificador del par: {peer_id:?}");
+    let piece_length = match u32::try_from(single_file.piece_length) {
+        Ok(piece_length) => piece_length,
+        Err(_) => {
+            eprintln!("la longitud de pieza es demasiado grande: {}", single_file.piece_length);
+            return;
+        }
+    };
 
-    TrackerRequest { info_hash, peer_id, port, uploaded: 0, downloaded: 0, left: length, compact: 1, event: Some(AnnounceEvent::Started), tracker_id: None }
+    let mut pieces = match create_pieces(single_file.length, piece_length, single_file.pieces.as_ref()) {
+        Ok(pieces) => pieces,
+        Err(err) => {
+            eprintln!("no se pudieron crear las piezas: {err}");
+            return;
+        }
+    };
+
+    match fs::File::create(&single_file.name) {
+        Ok(_) => {}
+        Err(err) => {
+            eprintln!("no se pudo crear el archivo de descarga: {err}");
+            return;
+        }
+    }
+
+    peer_loop(&mut stream, &mut pieces, &single_file.name, piece_length).await;
 }

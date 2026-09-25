@@ -32,7 +32,6 @@ pub(crate) fn get_info_bytes(bytes: &[u8]) -> Result<&[u8], String> {
             return Err("el diccionario principal no tiene una 'e' final".to_string());
         }
 
-        // La 'e' termina el diccionario principal.
         if bytes[position] == b'e' {
             let position_after_dictionary = position + 1;
 
@@ -46,10 +45,8 @@ pub(crate) fn get_info_bytes(bytes: &[u8]) -> Result<&[u8], String> {
             };
         }
 
-        // Las claves de un diccionario bencode siempre son byte strings.
         let (key, value_start) = read_bencode_byte_string(bytes, position)?;
 
-        // Saltamos el valor completo para descubrir dónde termina.
         let value_end = skip_bencode_field(value_start, bytes)?;
 
         if key == b"info" {
@@ -64,7 +61,6 @@ pub(crate) fn get_info_bytes(bytes: &[u8]) -> Result<&[u8], String> {
             info_range = Some((value_start, value_end));
         }
 
-        // El próximo campo comienza después del valor actual.
         position = value_end;
     }
 }
@@ -144,7 +140,6 @@ fn skip_bencode_integer(position: usize, bytes: &[u8]) -> Result<usize, String> 
         return Err("el entero esta incompleto".to_string());
     }
 
-    // Bencode permite enteros negativos.
     if bytes[cursor] == b'-' {
         cursor += 1;
     }
@@ -163,7 +158,6 @@ fn skip_bencode_integer(position: usize, bytes: &[u8]) -> Result<usize, String> 
         return Err(format!("el entero de la posicion {position} no termina con 'e'"));
     }
 
-    // Regresamos la posición posterior a la 'e'.
     Ok(cursor + 1)
 }
 
@@ -203,10 +197,8 @@ fn skip_bencode_dictionary(position: usize, bytes: &[u8]) -> Result<usize, Strin
             return Ok(cursor + 1);
         }
 
-        // Cada clave de un diccionario debe ser una cadena.
         let (_, position_after_key) = read_bencode_byte_string(bytes, cursor)?;
 
-        // Después de la clave viene su valor.
         cursor = skip_bencode_field(position_after_key, bytes)?;
     }
 }
