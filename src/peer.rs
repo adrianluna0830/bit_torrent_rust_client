@@ -5,10 +5,42 @@ use std::{io, net::SocketAddrV4};
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, Instant, timeout, timeout_at};
 
 const BLOCK_SIZE: u32 = 16_384;
 const MAX_REQUESTS_PER_ITERATION: usize = 8;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug)]
+pub(crate) enum PeerLoopResult {
+    NoPeersAvailable,
+    Completed,
+    ConnectionError(io::Error),
+    HandshakeTimeout,
+    PeerDisconnected(io::Error),
+    PeerError(String),
+    IoError(io::Error),
+    SaveError(io::Error),
+    RequestTimeout { piece_index: usize, begin: u32 },
+}
+
+impl std::fmt::Display for PeerLoopResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoPeersAvailable => write!(formatter, "no habia pares disponibles"),
+            Self::Completed => write!(formatter, "descarga completada"),
+            Self::ConnectionError(err) => write!(formatter, "error de conexion: {err}"),
+            Self::HandshakeTimeout => write!(formatter, "se agoto el tiempo del saludo inicial"),
+            Self::PeerDisconnected(err) => write!(formatter, "el par se desconecto: {err}"),
+            Self::PeerError(err) => write!(formatter, "error del par: {err}"),
+            Self::IoError(err) => write!(formatter, "error de entrada o salida: {err}"),
+            Self::SaveError(err) => write!(formatter, "error al guardar: {err}"),
+            Self::RequestTimeout { piece_index, begin } => {
+                write!(formatter, "se agoto el tiempo de la pieza {piece_index}, inicio {begin}")
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlockState {
@@ -23,6 +55,7 @@ struct Block {
     length: u32,
     data: Vec<u8>,
     state: BlockState,
+    requested_at: Option<Instant>,
 }
 
 impl Block {
@@ -34,7 +67,12 @@ impl Block {
         }
 
         self.data.extend_from_slice(data);
-        self.state = if new_length == self.length as usize { BlockState::Received } else { BlockState::Pending };
+        if new_length == self.length as usize {
+            self.state = BlockState::Received;
+            self.requested_at = None;
+        } else {
+            self.state = BlockState::Pending;
+        }
 
         Ok(())
     }
@@ -76,12 +114,8 @@ impl Piece {
         for block in &mut self.blocks {
             block.data.clear();
             block.state = BlockState::NotRequested;
+            block.requested_at = None;
         }
-    }
-
-    fn reset_blocks(&mut self) {
-        self.verified = false;
-        self.clear_blocks();
     }
 }
 
@@ -112,7 +146,7 @@ pub(crate) fn create_pieces(total_size: u64, piece_length: u32, piece_hashes: &[
         while begin < piece_size {
             let length = (piece_size - begin).min(BLOCK_SIZE);
 
-            blocks.push(Block { begin, length, data: Vec::with_capacity(length as usize), state: BlockState::NotRequested });
+            blocks.push(Block { begin, length, data: Vec::with_capacity(length as usize), state: BlockState::NotRequested, requested_at: None });
 
             begin += length;
         }
@@ -129,20 +163,48 @@ pub(crate) fn create_pieces(total_size: u64, piece_length: u32, piece_hashes: &[
     Ok(pieces)
 }
 
-pub(crate) async fn peer_loop(stream: &mut TcpStream, pieces: &mut Vec<Piece>, output_path: &str, piece_length: u32) {
+pub(crate) fn reset_pending_requests(pieces: &mut [Piece]) {
+    for piece in pieces {
+        for block in &mut piece.blocks {
+            if block.state == BlockState::Pending {
+                block.data.clear();
+                block.state = BlockState::NotRequested;
+                block.requested_at = None;
+            }
+        }
+    }
+}
+
+pub(crate) async fn peer_loop(stream: &mut TcpStream, pieces: &mut Vec<Piece>, output_path: &str, piece_length: u32) -> PeerLoopResult {
     let mut peer_choked = true;
     let mut peer_pieces = vec![false; pieces.len()];
     let mut has_used_interested = false;
     loop {
-        let message = match read_peer_message(stream).await {
-            Ok(message) => message,
-            Err(err) => {
-                eprintln!("no se pudo leer el mensaje del par: {err}");
-                break;
+        let pending_request = earliest_pending_request(pieces);
+
+        let message = if let Some((piece_index, begin, deadline)) = pending_request {
+            match timeout_at(deadline, read_peer_message(stream)).await {
+                Ok(Ok(message)) => message,
+                Ok(Err(err)) => {
+                    eprintln!("no se pudo leer el mensaje del par: {err}");
+                    return peer_message_error_to_loop_result(err);
+                }
+                Err(_) => {
+                    eprintln!("se agotaron los 60 segundos para recibir la pieza {piece_index}, inicio {begin}");
+                    return PeerLoopResult::RequestTimeout { piece_index, begin };
+                }
+            }
+        } else {
+            match read_peer_message(stream).await {
+                Ok(message) => message,
+                Err(err) => {
+                    eprintln!("no se pudo leer el mensaje del par: {err}");
+                    return peer_message_error_to_loop_result(err);
+                }
             }
         };
 
-        println!("mensaje recibido: {message:#?}");
+        print_peer_message(&message);
 
         match message {
             PeerMessage::KeepAlive => {}
@@ -211,18 +273,25 @@ pub(crate) async fn peer_loop(stream: &mut TcpStream, pieces: &mut Vec<Piece>, o
                         piece.verified = true;
 
                         if let Err(err) = save_piece(output_path, piece_index, piece_length, &piece_data).await {
-                            piece.reset_blocks();
+                            piece.verified = false;
+                            piece.clear_blocks();
                             eprintln!("no se pudo guardar la pieza {piece_index}: {err}");
-                            return;
+                            return PeerLoopResult::SaveError(err);
                         }
 
                         piece.clear_blocks();
                         println!("pieza {piece_index} verificada correctamente");
+
+                        let verified_pieces = pieces.iter().filter(|piece| piece.verified).count();
+                        let progress = verified_pieces as f64 / pieces.len() as f64 * 100.0;
+
+                        println!("progreso: {progress:.2}%");
                     } else {
-                        piece.reset_blocks();
+                        piece.verified = false;
+                        piece.clear_blocks();
 
                         eprintln!("el par envio una pieza corrupta: {piece_index}. cerrando la conexion");
-                        return;
+                        return PeerLoopResult::PeerError(format!("el par envio una pieza corrupta: {piece_index}"));
                     }
                 }
             }
@@ -238,7 +307,7 @@ pub(crate) async fn peer_loop(stream: &mut TcpStream, pieces: &mut Vec<Piece>, o
 
                 if let Err(err) = stream.write_all(&interested_bytes).await {
                     eprintln!("no se pudo enviar el mensaje de interes: {err}");
-                    return;
+                    return PeerLoopResult::IoError(err);
                 }
 
                 has_used_interested = true;
@@ -273,10 +342,11 @@ pub(crate) async fn peer_loop(stream: &mut TcpStream, pieces: &mut Vec<Piece>, o
 
                     if let Err(err) = stream.write_all(&request_bytes).await {
                         eprintln!("no se pudo enviar la solicitud de la pieza {piece_index}: {err}");
-                        return;
+                        return PeerLoopResult::IoError(err);
                     }
 
                     block.state = BlockState::Pending;
+                    block.requested_at = Some(Instant::now());
                     requests_sent += 1;
                     println!("solicitud enviada: pieza {piece_index}, inicio {}, longitud {}", block.begin, block.length);
                 }
@@ -294,15 +364,88 @@ pub(crate) async fn peer_loop(stream: &mut TcpStream, pieces: &mut Vec<Piece>, o
 
         if all_pieces_verified {
             println!("todas las piezas fueron descargadas y verificadas correctamente");
-            break;
+            return PeerLoopResult::Completed;
         }
     }
 }
 
-async fn read_peer_message(stream: &mut TcpStream) -> Result<PeerMessage, String> {
+fn print_peer_message(message: &PeerMessage) {
+    match message {
+        PeerMessage::KeepAlive => println!("mensaje de mantenimiento recibido"),
+        PeerMessage::Choke => println!("mensaje de bloqueo recibido"),
+        PeerMessage::Unchoke => println!("mensaje de desbloqueo recibido"),
+        PeerMessage::Interested => println!("mensaje de interes recibido"),
+        PeerMessage::NotInterested => println!("mensaje sin interes recibido"),
+        PeerMessage::Have(index) => println!("mensaje de disponibilidad recibido: pieza {index}"),
+        PeerMessage::Bitfield(items) => println!("mapa de piezas recibido: {} bytes", items.len()),
+        PeerMessage::Request { index, begin, length } => {
+            println!("solicitud recibida: pieza {index}, inicio {begin}, longitud {length}")
+        }
+        PeerMessage::Piece { index, begin, block } => {
+            println!("bloque recibido: pieza {index}, inicio {begin}, longitud {}", block.len())
+        }
+        PeerMessage::Cancel { index, begin, length } => {
+            println!("cancelacion recibida: pieza {index}, inicio {begin}, longitud {length}")
+        }
+    }
+}
+
+fn earliest_pending_request(pieces: &[Piece]) -> Option<(usize, u32, Instant)> {
+    let mut earliest: Option<(usize, u32, Instant)> = None;
+
+    for (piece_index, piece) in pieces.iter().enumerate() {
+        for block in &piece.blocks {
+            if block.state != BlockState::Pending {
+                continue;
+            }
+
+            let Some(requested_at) = block.requested_at else {
+                continue;
+            };
+
+            let deadline = requested_at + REQUEST_TIMEOUT;
+
+            match earliest {
+                Some((_, _, earliest_deadline)) if earliest_deadline <= deadline => {}
+                _ => earliest = Some((piece_index, block.begin, deadline)),
+            }
+        }
+    }
+
+    earliest
+}
+
+#[derive(Debug)]
+enum ReadPeerMessageError {
+    Io(io::Error),
+    InvalidMessage(String),
+}
+
+impl std::fmt::Display for ReadPeerMessageError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(err) => write!(formatter, "{err}"),
+            Self::InvalidMessage(err) => write!(formatter, "{err}"),
+        }
+    }
+}
+
+fn peer_message_error_to_loop_result(error: ReadPeerMessageError) -> PeerLoopResult {
+    match error {
+        ReadPeerMessageError::Io(err)
+            if matches!(err.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected) =>
+        {
+            PeerLoopResult::PeerDisconnected(err)
+        }
+        ReadPeerMessageError::Io(err) => PeerLoopResult::IoError(err),
+        ReadPeerMessageError::InvalidMessage(err) => PeerLoopResult::PeerError(err),
+    }
+}
+
+async fn read_peer_message(stream: &mut TcpStream) -> Result<PeerMessage, ReadPeerMessageError> {
     let mut message_length_buffer = [0u8; 4];
 
-    stream.read_exact(&mut message_length_buffer).await.map_err(|err| format!("no se pudo leer la longitud del mensaje: {err}"))?;
+    stream.read_exact(&mut message_length_buffer).await.map_err(ReadPeerMessageError::Io)?;
 
     let length = u32::from_be_bytes(message_length_buffer) as usize;
     let mut peer_message_bytes = Vec::with_capacity(4 + length);
@@ -311,12 +454,12 @@ async fn read_peer_message(stream: &mut TcpStream) -> Result<PeerMessage, String
     if length != 0 {
         let mut message_content_buffer = vec![0u8; length];
 
-        stream.read_exact(&mut message_content_buffer).await.map_err(|err| format!("no se pudo leer el contenido del mensaje: {err}"))?;
+        stream.read_exact(&mut message_content_buffer).await.map_err(ReadPeerMessageError::Io)?;
 
         peer_message_bytes.extend_from_slice(&message_content_buffer);
     }
 
-    PeerMessage::from_bytes(&peer_message_bytes)
+    PeerMessage::from_bytes(&peer_message_bytes).map_err(ReadPeerMessageError::InvalidMessage)
 }
 
 pub(crate) async fn connect_to_peer(peer: SocketAddrV4) -> io::Result<TcpStream> {
@@ -332,6 +475,25 @@ pub(crate) fn build_handshake(info_hash: [u8; 20], peer_id: [u8; 20]) -> [u8; 68
     handshake[48..68].copy_from_slice(&peer_id);
 
     handshake
+}
+
+pub(crate) fn validate_peer_handshake(handshake: &[u8; 68], expected_info_hash: &[u8; 20]) -> Result<(), String> {
+    if handshake[0] != 19 {
+        return Err(format!("longitud del protocolo invalida: {}", handshake[0]));
+    }
+
+    if &handshake[1..20] != b"BitTorrent protocol" {
+        return Err("el par no utiliza el protocolo bittorrent".to_string());
+    }
+
+    if &handshake[28..48] != expected_info_hash {
+        return Err("el hash de informacion recibido no coincide".to_string());
+    }
+
+    let peer_id = &handshake[48..68];
+    println!("identificador del par: {peer_id:?}");
+
+    Ok(())
 }
 
 async fn save_piece(path: &str, piece_index: usize, piece_length: u32, data: &[u8]) -> io::Result<()> {
