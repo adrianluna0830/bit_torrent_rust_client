@@ -1,10 +1,14 @@
 use rand::RngExt;
 use serde::Deserialize;
 use serde_bytes::ByteBuf;
-use sha1::{Digest, Sha1};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::collections::HashSet;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use tokio::net::UdpSocket;
+use tokio::time::{Duration, timeout};
+use url::Url;
 
 const CHARACTERS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+const TRACKER_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) struct TrackerRequest {
     pub(crate) info_hash: [u8; 20],
@@ -102,34 +106,197 @@ fn percent_encode(bytes: &[u8]) -> String {
     resultado
 }
 
-pub(crate) fn build_initial_tracker_request(info_bytes: &[u8], port: u16, length: u64) -> TrackerRequest {
-    let mut hasher = Sha1::new();
-    hasher.update(info_bytes);
-
-    let info_hash: [u8; 20] = hasher.finalize().into();
-
+pub(crate) fn generate_id() -> [u8; 20] {
     let mut rng = rand::rng();
 
-    let peer_id: [u8; 20] = std::array::from_fn(|_| {
+    std::array::from_fn(|_| {
         let position = rng.random_range(0..CHARACTERS.len());
         CHARACTERS[position]
-    });
+    })
+}
 
+pub(crate) fn generate_random_u32() -> u32 {
+    let mut rng = rand::rng();
+    rng.random::<u32>()
+}
+
+pub(crate) fn build_initial_tracker_request(info_hash: [u8; 20], peer_id: [u8; 20], port: u16, length: u64) -> TrackerRequest {
     TrackerRequest { info_hash, peer_id, port, uploaded: 0, downloaded: 0, left: length, compact: 1, event: Some(AnnounceEvent::Started), tracker_id: None }
 }
 
-pub(crate) fn parse_compact_peers(bytes: &[u8]) -> Result<Vec<SocketAddrV4>, String> {
+pub(crate) fn parse_compact_peers(bytes: &[u8]) -> Result<HashSet<SocketAddrV4>, String> {
     if bytes.len() % 6 != 0 {
         return Err("compact peers no es multiplo de 6".to_string());
     }
 
-    let mut socket_addresses: Vec<SocketAddrV4> = Vec::new();
+    let mut socket_addresses = HashSet::new();
 
     for chunk in bytes.chunks_exact(6) {
         let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
         let port = u16::from_be_bytes([chunk[4], chunk[5]]);
         let dir = SocketAddrV4::new(ip, port);
-        socket_addresses.push(dir);
+        socket_addresses.insert(dir);
     }
     Ok(socket_addresses)
+}
+
+async fn receive_udp_response(socket: &UdpSocket, tracker_addr: SocketAddrV4, transaction_id: u32, buffer: &mut [u8]) -> Result<usize, String> {
+    loop {
+        let (size, sender) = socket.recv_from(buffer).await.map_err(|err| err.to_string())?;
+
+        if sender != SocketAddr::V4(tracker_addr) || size < 8 {
+            continue;
+        }
+
+        let received_id = u32::from_be_bytes(buffer[4..8].try_into().unwrap());
+
+        if received_id == transaction_id {
+            return Ok(size);
+        }
+    }
+}
+
+async fn get_peers_from_udp(announce: &str, info_hash: [u8; 20], peer_id: [u8; 20], port: u16, total_length: u64) -> Result<HashSet<SocketAddrV4>, String> {
+    let url = Url::parse(announce).map_err(|err| err.to_string())?;
+
+    if url.scheme() != "udp" {
+        return Err("se esperaba una URL udp://".into());
+    }
+
+    let host = url.host_str().ok_or_else(|| "la URL no contiene un host".to_string())?;
+    let tracker_port = url.port().ok_or_else(|| "la URL no contiene un puerto".to_string())?;
+    let tracker_addr = tokio::net::lookup_host((host, tracker_port))
+        .await
+        .map_err(|err| err.to_string())?
+        .find_map(|addr| match addr {
+            SocketAddr::V4(addr) => Some(addr),
+            SocketAddr::V6(_) => None,
+        })
+        .ok_or_else(|| "el tracker no tiene dirección IPv4".to_string())?;
+    let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(|err| err.to_string())?;
+    let connect_transaction_id = generate_random_u32();
+    let mut connect_packet = [0u8; 16];
+    connect_packet[0..8].copy_from_slice(&0x41727101980u64.to_be_bytes());
+    connect_packet[8..12].copy_from_slice(&0u32.to_be_bytes());
+    connect_packet[12..16].copy_from_slice(&connect_transaction_id.to_be_bytes());
+    let mut connect_response = [0u8; 2048];
+    let mut connect_size = None;
+
+    for wait_seconds in [15, 30, 60] {
+        socket.send_to(&connect_packet, tracker_addr).await.map_err(|err| err.to_string())?;
+
+        match timeout(Duration::from_secs(wait_seconds), receive_udp_response(&socket, tracker_addr, connect_transaction_id, &mut connect_response)).await {
+            Ok(Ok(size)) => {
+                connect_size = Some(size);
+                break;
+            }
+            Ok(Err(err)) => return Err(err),
+            Err(_) => continue,
+        }
+    }
+
+    let connect_size = connect_size.ok_or_else(|| "el tracker no respondió al connect tras 3 intentos".to_string())?;
+    let action = u32::from_be_bytes(connect_response[0..4].try_into().unwrap());
+
+    if action == 3 {
+        let message = String::from_utf8_lossy(&connect_response[8..connect_size]);
+        return Err(format!("error del tracker en connect: {message}"));
+    }
+
+    if action != 0 || connect_size < 16 {
+        return Err("respuesta connect inválida".into());
+    }
+
+    let connection_id = u64::from_be_bytes(connect_response[8..16].try_into().unwrap());
+    let announce_transaction_id = generate_random_u32();
+    let key = generate_random_u32();
+    let mut announce_packet = Vec::with_capacity(98);
+    announce_packet.extend_from_slice(&connection_id.to_be_bytes());
+    announce_packet.extend_from_slice(&1u32.to_be_bytes());
+    announce_packet.extend_from_slice(&announce_transaction_id.to_be_bytes());
+    announce_packet.extend_from_slice(&info_hash);
+    announce_packet.extend_from_slice(&peer_id);
+    announce_packet.extend_from_slice(&0u64.to_be_bytes());
+    announce_packet.extend_from_slice(&total_length.to_be_bytes());
+    announce_packet.extend_from_slice(&0u64.to_be_bytes());
+    announce_packet.extend_from_slice(&2u32.to_be_bytes());
+    announce_packet.extend_from_slice(&0u32.to_be_bytes());
+    announce_packet.extend_from_slice(&key.to_be_bytes());
+    announce_packet.extend_from_slice(&(-1i32).to_be_bytes());
+    announce_packet.extend_from_slice(&port.to_be_bytes());
+    let mut announce_response = vec![0u8; 65_535];
+    let mut announce_size = None;
+
+    for wait_seconds in [15, 30, 60] {
+        socket.send_to(&announce_packet, tracker_addr).await.map_err(|err| err.to_string())?;
+
+        match timeout(Duration::from_secs(wait_seconds), receive_udp_response(&socket, tracker_addr, announce_transaction_id, &mut announce_response)).await {
+            Ok(Ok(size)) => {
+                announce_size = Some(size);
+                break;
+            }
+            Ok(Err(err)) => return Err(err),
+            Err(_) => continue,
+        }
+    }
+
+    let announce_size = announce_size.ok_or_else(|| "el tracker no respondió al announce tras 3 intentos".to_string())?;
+    let action = u32::from_be_bytes(announce_response[0..4].try_into().unwrap());
+
+    if action == 3 {
+        let message = String::from_utf8_lossy(&announce_response[8..announce_size]);
+        return Err(format!("error del tracker en announce: {message}"));
+    }
+
+    if action != 1 || announce_size < 20 {
+        return Err("respuesta announce inválida".into());
+    }
+
+    parse_compact_peers(&announce_response[20..announce_size])
+}
+
+pub(crate) async fn announce_and_get_peers(length: u64, info_hash: [u8; 20], peer_id: [u8; 20], port: u16, announces: &[Vec<String>]) -> Result<HashSet<SocketAddrV4>, String> {
+    let mut peers = HashSet::new();
+    let mut had_valid_response = false;
+    let tracker_request = build_initial_tracker_request(info_hash, peer_id, port, length);
+
+    for tier in announces {
+        for announce in tier {
+            if announce.starts_with("udp://") {
+                let Ok(parsed_peers) = get_peers_from_udp(announce, info_hash, peer_id, port, length).await else {
+                    continue;
+                };
+
+                had_valid_response = true;
+                peers.extend(parsed_peers);
+                continue;
+            }
+
+            if !announce.starts_with("https://") && !announce.starts_with("http://") {
+                continue;
+            }
+
+            let url = build_url(announce, &tracker_request);
+            let Ok(response) = timeout(TRACKER_TIMEOUT, announce_to_tracker(&url)).await else {
+                continue;
+            };
+            let Ok(response_bytes) = response else {
+                continue;
+            };
+            let Ok(tracker_response) = serde_bencode::from_bytes::<TrackerResponse>(&response_bytes) else {
+                continue;
+            };
+            let Some(peers_bytes) = tracker_response.peers else {
+                continue;
+            };
+            let Ok(parsed_peers) = parse_compact_peers(peers_bytes.as_ref()) else {
+                continue;
+            };
+
+            had_valid_response = true;
+            peers.extend(parsed_peers);
+        }
+    }
+
+    if had_valid_response { Ok(peers) } else { Err("no se pudo consultar ningún tracker".into()) }
 }

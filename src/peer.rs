@@ -53,29 +53,8 @@ enum BlockState {
 struct Block {
     begin: u32,
     length: u32,
-    data: Vec<u8>,
     state: BlockState,
     requested_at: Option<Instant>,
-}
-
-impl Block {
-    fn add_data(&mut self, data: &[u8]) -> Result<(), String> {
-        let new_length = self.data.len().checked_add(data.len()).ok_or_else(|| "la longitud del bloque es demasiado grande".to_string())?;
-
-        if new_length > self.length as usize {
-            return Err(format!("los datos superarían la longitud del bloque: máximo {}, resultado {new_length}", self.length));
-        }
-
-        self.data.extend_from_slice(data);
-        if new_length == self.length as usize {
-            self.state = BlockState::Received;
-            self.requested_at = None;
-        } else {
-            self.state = BlockState::Pending;
-        }
-
-        Ok(())
-    }
 }
 
 #[derive(Debug)]
@@ -90,29 +69,8 @@ impl Piece {
         self.blocks.iter().all(|block| block.state == BlockState::Received)
     }
 
-    fn calculate_hash(&self) -> [u8; 20] {
-        let mut hasher = Sha1::new();
-
-        for block in &self.blocks {
-            hasher.update(&block.data);
-        }
-
-        hasher.finalize().into()
-    }
-
-    fn data(&self) -> Vec<u8> {
-        let mut data = Vec::new();
-
-        for block in &self.blocks {
-            data.extend_from_slice(&block.data);
-        }
-
-        data
-    }
-
     fn clear_blocks(&mut self) {
         for block in &mut self.blocks {
-            block.data.clear();
             block.state = BlockState::NotRequested;
             block.requested_at = None;
         }
@@ -146,7 +104,7 @@ pub(crate) fn create_pieces(total_size: u64, piece_length: u32, piece_hashes: &[
         while begin < piece_size {
             let length = (piece_size - begin).min(BLOCK_SIZE);
 
-            blocks.push(Block { begin, length, data: Vec::with_capacity(length as usize), state: BlockState::NotRequested, requested_at: None });
+            blocks.push(Block { begin, length, state: BlockState::NotRequested, requested_at: None });
 
             begin += length;
         }
@@ -167,7 +125,6 @@ pub(crate) fn reset_pending_requests(pieces: &mut [Piece]) {
     for piece in pieces {
         for block in &mut piece.blocks {
             if block.state == BlockState::Pending {
-                block.data.clear();
                 block.state = BlockState::NotRequested;
                 block.requested_at = None;
             }
@@ -186,11 +143,9 @@ pub(crate) async fn peer_loop(stream: &mut TcpStream, pieces: &mut Vec<Piece>, o
             match timeout_at(deadline, read_peer_message(stream)).await {
                 Ok(Ok(message)) => message,
                 Ok(Err(err)) => {
-                    eprintln!("no se pudo leer el mensaje del par: {err}");
                     return peer_message_error_to_loop_result(err);
                 }
                 Err(_) => {
-                    eprintln!("se agotaron los 60 segundos para recibir la pieza {piece_index}, inicio {begin}");
                     return PeerLoopResult::RequestTimeout { piece_index, begin };
                 }
             }
@@ -198,13 +153,10 @@ pub(crate) async fn peer_loop(stream: &mut TcpStream, pieces: &mut Vec<Piece>, o
             match read_peer_message(stream).await {
                 Ok(message) => message,
                 Err(err) => {
-                    eprintln!("no se pudo leer el mensaje del par: {err}");
                     return peer_message_error_to_loop_result(err);
                 }
             }
         };
-
-        print_peer_message(&message);
 
         match message {
             PeerMessage::KeepAlive => {}
@@ -218,12 +170,10 @@ pub(crate) async fn peer_loop(stream: &mut TcpStream, pieces: &mut Vec<Piece>, o
             PeerMessage::NotInterested => {}
             PeerMessage::Have(piece) => {
                 let Ok(piece_index) = usize::try_from(piece) else {
-                    eprintln!("el indice de pieza no cabe en usize: {piece}");
                     continue;
                 };
 
                 let Some(peer_has_piece) = peer_pieces.get_mut(piece_index) else {
-                    eprintln!("el mensaje de disponibilidad contiene un indice de pieza invalido: {piece_index}");
                     continue;
                 };
 
@@ -245,55 +195,46 @@ pub(crate) async fn peer_loop(stream: &mut TcpStream, pieces: &mut Vec<Piece>, o
             }
             PeerMessage::Request { index, begin, length } => {}
             PeerMessage::Piece { index, begin, block } => {
-                let Ok(piece_index) = usize::try_from(index) else {
-                    eprintln!("el indice de pieza no cabe en usize: {index}");
-                    continue;
-                };
+                //                 let Ok(piece_index) = usize::try_from(index) else {
+                //                     continue;
+                //                 };
+                //
+                //                 let Some(piece) = pieces.get_mut(piece_index) else {
+                //                     continue;
+                //                 };
+                //
+                //                 let Some(expected_block) = piece.blocks.iter_mut().find(|expected_block| expected_block.begin == begin) else {
+                //                     continue;
+                //                 };
+                //
+                //                 if let Err(err) = expected_block.add_data(&block) {
+                //                     continue;
+                //                 }
 
-                let Some(piece) = pieces.get_mut(piece_index) else {
-                    eprintln!("el mensaje de pieza contiene un indice invalido: {piece_index}");
-                    continue;
-                };
-
-                let Some(expected_block) = piece.blocks.iter_mut().find(|expected_block| expected_block.begin == begin) else {
-                    eprintln!("el mensaje de pieza contiene un desplazamiento desconocido: {begin}");
-                    continue;
-                };
-
-                if let Err(err) = expected_block.add_data(&block) {
-                    eprintln!("no se pudieron guardar los datos del bloque: {err}");
-                    continue;
-                }
-
-                if piece.all_blocks_received() {
-                    let actual_hash = piece.calculate_hash();
-
-                    if actual_hash == piece.expected_hash {
-                        let piece_data = piece.data();
-                        piece.verified = true;
-
-                        if let Err(err) = save_piece(output_path, piece_index, piece_length, &piece_data).await {
-                            piece.verified = false;
-                            piece.clear_blocks();
-                            eprintln!("no se pudo guardar la pieza {piece_index}: {err}");
-                            return PeerLoopResult::SaveError(err);
-                        }
-
-                        piece.clear_blocks();
-                        println!("pieza {piece_index} verificada correctamente");
-
-                        let verified_pieces = pieces.iter().filter(|piece| piece.verified).count();
-                        let progress = verified_pieces as f64 / pieces.len() as f64 * 100.0;
-
-                        println!("progreso: {progress:.2}%");
-                    } else {
-                        piece.verified = false;
-                        piece.clear_blocks();
-
-                        eprintln!("el par envio una pieza corrupta: {piece_index}. cerrando la conexion");
-                        return PeerLoopResult::PeerError(format!("el par envio una pieza corrupta: {piece_index}"));
-                    }
-                }
+                //                 if piece.all_blocks_received() {
+                //                     let actual_hash = piece.calculate_hash();
+                //
+                //                     if actual_hash == piece.expected_hash {
+                //                         let piece_data = piece.data();
+                //                         piece.verified = true;
+                //
+                //                         if let Err(err) = save_piece(output_path, piece_index, piece_length, &piece_data).await {
+                //                             piece.verified = false;
+                //                             piece.clear_blocks();
+                //                             return PeerLoopResult::SaveError(err);
+                //                         }
+                //
+                //                         piece.clear_blocks();
+                //
+                //                         let verified_pieces = pieces.iter().filter(|piece| piece.verified).count();
+                //                         let progress = verified_pieces as f64 / pieces.len() as f64 * 100.0;
+                //                     } else {
+                //                         piece.verified = false;
+                //                         piece.clear_blocks();
+                //
+                //                         return PeerLoopResult::PeerError(format!("el par envio una pieza corrupta: {piece_index}"));
+                //                     }
+                //                 }
             }
             PeerMessage::Cancel { index, begin, length } => {}
         }
@@ -306,12 +247,10 @@ pub(crate) async fn peer_loop(stream: &mut TcpStream, pieces: &mut Vec<Piece>, o
                 let interested_bytes = PeerMessage::Interested.to_bytes();
 
                 if let Err(err) = stream.write_all(&interested_bytes).await {
-                    eprintln!("no se pudo enviar el mensaje de interes: {err}");
                     return PeerLoopResult::IoError(err);
                 }
 
                 has_used_interested = true;
-                println!("mensaje de interes enviado correctamente");
                 break;
             }
         }
@@ -325,7 +264,6 @@ pub(crate) async fn peer_loop(stream: &mut TcpStream, pieces: &mut Vec<Piece>, o
                 }
 
                 let Ok(index) = u32::try_from(piece_index) else {
-                    eprintln!("el indice de la pieza es demasiado grande: {piece_index}");
                     break;
                 };
 
@@ -341,14 +279,12 @@ pub(crate) async fn peer_loop(stream: &mut TcpStream, pieces: &mut Vec<Piece>, o
                     let request_bytes = PeerMessage::Request { index, begin: block.begin, length: block.length }.to_bytes();
 
                     if let Err(err) = stream.write_all(&request_bytes).await {
-                        eprintln!("no se pudo enviar la solicitud de la pieza {piece_index}: {err}");
                         return PeerLoopResult::IoError(err);
                     }
 
                     block.state = BlockState::Pending;
                     block.requested_at = Some(Instant::now());
                     requests_sent += 1;
-                    println!("solicitud enviada: pieza {piece_index}, inicio {}, longitud {}", block.begin, block.length);
                 }
             }
         }
@@ -363,29 +299,7 @@ pub(crate) async fn peer_loop(stream: &mut TcpStream, pieces: &mut Vec<Piece>, o
         }
 
         if all_pieces_verified {
-            println!("todas las piezas fueron descargadas y verificadas correctamente");
             return PeerLoopResult::Completed;
-        }
-    }
-}
-
-fn print_peer_message(message: &PeerMessage) {
-    match message {
-        PeerMessage::KeepAlive => println!("mensaje de mantenimiento recibido"),
-        PeerMessage::Choke => println!("mensaje de bloqueo recibido"),
-        PeerMessage::Unchoke => println!("mensaje de desbloqueo recibido"),
-        PeerMessage::Interested => println!("mensaje de interes recibido"),
-        PeerMessage::NotInterested => println!("mensaje sin interes recibido"),
-        PeerMessage::Have(index) => println!("mensaje de disponibilidad recibido: pieza {index}"),
-        PeerMessage::Bitfield(items) => println!("mapa de piezas recibido: {} bytes", items.len()),
-        PeerMessage::Request { index, begin, length } => {
-            println!("solicitud recibida: pieza {index}, inicio {begin}, longitud {length}")
-        }
-        PeerMessage::Piece { index, begin, block } => {
-            println!("bloque recibido: pieza {index}, inicio {begin}, longitud {}", block.len())
-        }
-        PeerMessage::Cancel { index, begin, length } => {
-            println!("cancelacion recibida: pieza {index}, inicio {begin}, longitud {length}")
         }
     }
 }
@@ -489,9 +403,6 @@ pub(crate) fn validate_peer_handshake(handshake: &[u8; 68], expected_info_hash: 
     if &handshake[28..48] != expected_info_hash {
         return Err("el hash de informacion recibido no coincide".to_string());
     }
-
-    let peer_id = &handshake[48..68];
-    println!("identificador del par: {peer_id:?}");
 
     Ok(())
 }

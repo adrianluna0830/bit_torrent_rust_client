@@ -54,6 +54,7 @@ dependencies = [
  "serde_bytes",
  "sha1",
  "tokio",
+ "url",
 ]
 
 [[package]]

@@ -1,13 +1,19 @@
+mod dht;
 mod peer;
 mod peer_message;
 mod torrent;
 mod torrent_info;
 mod tracker;
 
+use crate::dht::announce_and_get_peers_dht;
 use crate::peer::{PeerLoopResult, build_handshake, connect_to_peer, create_pieces, peer_loop, reset_pending_requests, validate_peer_handshake};
-use crate::torrent::{Info, SingleFile, Torrent};
+use crate::torrent::{Info, SingleFile, Torrent, get_torrent_from_magnet, torrent_from_bytes};
 use crate::torrent_info::get_info_bytes;
-use crate::tracker::{TrackerResponse, announce_to_tracker, build_initial_tracker_request, build_url, parse_compact_peers};
+use crate::tracker::{announce_and_get_peers, generate_id};
+use sha1::{Digest, Sha1};
+use std::collections::HashSet;
+use std::net::SocketAddrV4;
+use std::path::Path;
 use std::{fs, io};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -16,178 +22,184 @@ use tokio::time::{Duration, timeout};
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[tokio::main]
-async fn main() {
-    println!("iniciando cliente bittorrent");
-    println!("leyendo archivo torrent");
-
-    let bytes = fs::read("ubuntu-26.04.1-live-server-amd64.iso.torrent").expect("no se pudo leer el archivo .torrent");
-
-    println!("archivo torrent leido: {} bytes", bytes.len());
-
-    let torrent: Torrent = serde_bencode::from_bytes(&bytes).expect("no se pudo decodificar el torrent");
-
-    println!("metadatos del torrent decodificados");
-
-    let single_file: SingleFile = match torrent.info {
-        Info::SingleFile(file) => file,
-        Info::MultiFile(_) => {
-            eprintln!("los torrents de varios archivos todavia no estan soportados");
-            return;
+async fn main() -> io::Result<()> {
+    let mut number: u8;
+    loop {
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).expect("Error al leer el input");
+        match input.trim().parse::<u8>() {
+            Ok(n) => {
+                number = n;
+                if number != 1 && number != 0 {
+                    continue;
+                }
+                break;
+            }
+            Err(_) => {}
         }
-    };
+    }
+    let info_hash: [u8; 20];
+    let peer_id: [u8; 20];
+    let torrent: Torrent;
+    let download_path: String;
+    let mut peers: HashSet<SocketAddrV4>;
+    let listener = TcpListener::bind("0.0.0.0:0").await?;
+    let port = listener.local_addr()?.port();
 
-    println!("torrent de un archivo seleccionado: {}", single_file.name);
-    println!("tamaño total de la descarga: {} bytes", single_file.length);
-    println!("longitud declarada de cada pieza: {} bytes", single_file.piece_length);
+    if number == 1 {
+        let mut input = String::new();
 
-    let announce = torrent.announce.as_deref().expect("el torrent no contiene announce");
+        io::stdin().read_line(&mut input).expect("Error al leer el input");
 
-    if !announce.starts_with("https://") && !announce.starts_with("http://") {
-        panic!("el tracker no usa http o https");
+        let mut download_path_string = String::new();
+
+        loop {
+            io::stdin().read_line(&mut download_path_string).expect("Error al leer el input");
+
+            let download_path = Path::new(download_path_string.trim());
+
+            if download_path.is_dir() {
+                break;
+            }
+        }
+        download_path = download_path_string;
+        peers = HashSet::new();
+        torrent = get_torrent_from_magnet(&input, &peers).await.expect("No se pudo obtener el torrent desde el magnet");
+        return Ok(());
+    } else {
+        let mut torrent_path_string = String::new();
+
+        loop {
+            io::stdin().read_line(&mut torrent_path_string).expect("Error al leer el input");
+
+            let torrent_path = Path::new(torrent_path_string.trim());
+
+            if torrent_path.is_file() {
+                break;
+            }
+        }
+        let mut download_path_string = String::new();
+
+        loop {
+            io::stdin().read_line(&mut download_path_string).expect("Error al leer el input");
+
+            let download_path = Path::new(download_path_string.trim());
+
+            if download_path.is_dir() {
+                break;
+            }
+        }
+        let bytes = fs::read(torrent_path_string).expect("no se pudo leer el archivo .torrent");
+        torrent = torrent_from_bytes(&bytes).expect("No se pudo leer el torrent");
+
+        let info_bytes = get_info_bytes(&bytes).expect("no se pudieron extraer los bytes de info");
+
+        let mut hasher = Sha1::new();
+        hasher.update(info_bytes);
+
+        info_hash = hasher.finalize().into();
+        peer_id = generate_id();
+        download_path = download_path_string;
+
+        let single_file = match &torrent.info {
+            Info::SingleFile(file) => file,
+            Info::MultiFile(_) => return Ok(()),
+        };
+
+        let mut announce: Option<Vec<Vec<String>>> = None;
+
+        if let Some(torrent_announce) = &torrent.announce {
+            announce = Some(vec![vec![torrent_announce.clone()]]);
+        }
+
+        if !torrent.announce_list.is_empty() {
+            announce = Some(torrent.announce_list.clone());
+        }
+
+        peers = HashSet::new();
+
+        if let Some(announce) = announce {
+            peers = announce_and_get_peers(single_file.length, info_hash, peer_id, port, &announce).await.expect("");
+        }
+
+        let dht_peers = announce_and_get_peers_dht(info_hash).await.expect("no se pudieron obtener peers mediante DHT");
+
+        println!("peers obtenidos mediante trackers: {}", peers.len());
+        println!("peers obtenidos mediante DHT: {}", dht_peers.len());
+
+        peers.extend(dht_peers);
     }
 
-    let info_bytes = get_info_bytes(&bytes).expect("no se pudieron extraer los bytes de info");
+    return Ok(());
 
-    println!("diccionario info extraido correctamente");
-
-    let total_length = single_file.length;
-
-    let listener = TcpListener::bind("0.0.0.0:0").await.expect("no se pudo abrir un puerto tcp");
-
-    let address = listener.local_addr().expect("no se pudo obtener la direccion local");
-
-    println!("puerto local asignado: {}", address.port());
-
-    let tracker_request = build_initial_tracker_request(info_bytes, address.port(), total_length);
-
-    println!("solicitud para el rastreador construida");
-
-    let url = build_url(announce, &tracker_request);
-
-    println!("url del rastreador: {url}");
-    println!("enviando solicitud al rastreador");
-
-    let response_bytes = announce_to_tracker(&url).await.expect("fallo la solicitud al tracker");
-
-    println!("respuesta del rastreador recibida: {} bytes", response_bytes.len());
-
-    let tracker_response: TrackerResponse = serde_bencode::from_bytes(&response_bytes).expect("respuesta bencode invalida");
-
-    println!("respuesta del rastreador decodificada");
-
-    let peers_bytes = tracker_response.peers.expect("no existen peers");
-
-    let peers = parse_compact_peers(peers_bytes.as_ref()).expect("lista compacta de peers invalida");
-
-    println!("cantidad de pares: {}", peers.len());
+    let single_file: &SingleFile = match &torrent.info {
+        Info::SingleFile(file) => file,
+        Info::MultiFile(_) => return Ok(()),
+    };
 
     let piece_length = match u32::try_from(single_file.piece_length) {
         Ok(piece_length) => piece_length,
-        Err(_) => {
-            eprintln!("la longitud de pieza es demasiado grande: {}", single_file.piece_length);
-            return;
-        }
+        Err(_) => return Ok(()),
     };
 
     let mut pieces = match create_pieces(single_file.length, piece_length, single_file.pieces.as_ref()) {
         Ok(pieces) => pieces,
-        Err(err) => {
-            eprintln!("no se pudieron crear las piezas: {err}");
-            return;
-        }
+        Err(_) => return Ok(()),
     };
 
-    println!("piezas preparadas para descargar: {}", pieces.len());
-
     match fs::File::create(&single_file.name) {
-        Ok(_) => {
-            println!("archivo de salida creado: {}", single_file.name);
-        }
-        Err(err) => {
-            eprintln!("no se pudo crear el archivo de descarga: {err}");
-            return;
-        }
+        Ok(_) => {}
+        Err(_) => return Ok(()),
     }
 
     let mut peer_loop_result = PeerLoopResult::NoPeersAvailable;
 
     for peer in peers {
-        println!("intentando conectar con el par {peer}");
-
         let mut stream = match connect_to_peer(peer).await {
-            Ok(stream) => {
-                println!("conectado al par {peer}");
-                stream
-            }
+            Ok(stream) => stream,
             Err(err) => {
-                if err.kind() == io::ErrorKind::ConnectionRefused {
-                    eprintln!("el par {peer} rechazo la conexion");
-                } else if err.kind() == io::ErrorKind::TimedOut {
-                    eprintln!("la conexion a {peer} supero los 2 segundos");
-                } else {
-                    eprintln!("no se pudo conectar a {peer}: {err}");
-                }
-
                 peer_loop_result = PeerLoopResult::ConnectionError(err);
                 continue;
             }
         };
 
-        let handshake_bytes = build_handshake(tracker_request.info_hash, tracker_request.peer_id);
-
-        println!("enviando saludo inicial al par {peer}");
+        let handshake_bytes = build_handshake(info_hash, peer_id);
 
         if let Err(err) = stream.write_all(&handshake_bytes).await {
-            eprintln!("no se pudo enviar el saludo inicial: {err}");
             peer_loop_result = PeerLoopResult::IoError(err);
             continue;
         }
 
-        println!("saludo inicial enviado correctamente");
-
         let mut buf = [0u8; 68];
 
-        println!("esperando saludo inicial del par {peer}");
-
         match timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut buf)).await {
-            Ok(Ok(_)) => {
-                println!("saludo inicial recibido correctamente");
-            }
+            Ok(Ok(_)) => {}
             Ok(Err(err)) => {
-                eprintln!("no se pudo leer el saludo inicial: {err}");
                 peer_loop_result = PeerLoopResult::PeerDisconnected(err);
                 continue;
             }
             Err(_) => {
-                eprintln!("se agotaron los 10 segundos para recibir el saludo inicial");
                 peer_loop_result = PeerLoopResult::HandshakeTimeout;
                 continue;
             }
         }
 
-        if let Err(err) = validate_peer_handshake(&buf, &tracker_request.info_hash) {
-            eprintln!("{err}");
+        if let Err(err) = validate_peer_handshake(&buf, &info_hash) {
             peer_loop_result = PeerLoopResult::PeerError(err);
             continue;
         }
-
-        println!("saludo inicial del par validado correctamente");
-        println!("iniciando intercambio de mensajes con el par {peer}");
 
         let result = peer_loop(&mut stream, &mut pieces, &single_file.name, piece_length).await;
         let completed = matches!(result, PeerLoopResult::Completed);
         peer_loop_result = result;
 
         if completed {
-            println!("descarga completada con el par {peer}");
             break;
         }
 
-        eprintln!("el intento con el par {peer} termino: {peer_loop_result}");
-        println!("preparando solicitudes pendientes para el siguiente par");
         reset_pending_requests(&mut pieces);
         continue;
     }
 
-    println!("resultado final del ciclo de pares: {peer_loop_result}");
+    Ok(())
 }
