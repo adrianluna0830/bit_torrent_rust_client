@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io;
 use tokio::net::TcpStream;
 
@@ -13,6 +14,23 @@ pub(crate) enum PeerMessage {
     Request { index: u32, begin: u32, length: u32 },
     Piece { index: u32, begin: u32, block: Vec<u8> },
     Cancel { index: u32, begin: u32, length: u32 },
+}
+
+impl fmt::Display for PeerMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::KeepAlive => write!(formatter, "KeepAlive"),
+            Self::Choke => write!(formatter, "Choke"),
+            Self::Unchoke => write!(formatter, "Unchoke"),
+            Self::Interested => write!(formatter, "Interested"),
+            Self::NotInterested => write!(formatter, "NotInterested"),
+            Self::Have(index) => write!(formatter, "Have: piece {index}"),
+            Self::Bitfield(bytes) => write!(formatter, "Bitfield: {} bytes", bytes.len()),
+            Self::Request { index, begin, length } => write!(formatter, "Request: piece {index}, offset {begin}, length {length}"),
+            Self::Piece { index, begin, block } => write!(formatter, "Piece: piece {index}, offset {begin}, length {}", block.len()),
+            Self::Cancel { index, begin, length } => write!(formatter, "Cancel: piece {index}, offset {begin}, length {length}"),
+        }
+    }
 }
 
 impl PeerMessage {

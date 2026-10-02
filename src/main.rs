@@ -1,9 +1,11 @@
-use crate::cli::{read_download_path, read_input_choice, read_magnet_url, read_torrent_path};
+use crate::cli::{read_download_path, read_torrent_path};
 use crate::dht::announce_and_get_peers_dht;
+use crate::logging::initialize_logging;
 use crate::peer_orchestrator::{
-    PEERS_PER_TORRENT, PeerTask, PeerWorkerEvent, assign_pieces_to_idle_workers, process_peer_worker_events, remove_peer, start_workers_for_new_connected_peers, try_start_pending_peer_connections,
+    MAX_ACTIVE_PEERS, MAX_CONNECTING_PEERS, PeerTask, PeerWorkerEvent, assign_pieces_to_idle_workers, process_peer_worker_events, remove_peer, start_workers_for_new_connected_peers,
+    try_start_pending_peer_connections,
 };
-use crate::torrent::{Info, SingleFile, Torrent, parse_magnet, torrent_from_bytes};
+use crate::torrent::{Info, torrent_from_bytes};
 use crate::torrent_info::get_info_bytes;
 use crate::tracker::{announce_and_get_peers, generate_id};
 use sha1::{Digest, Sha1};
@@ -12,13 +14,13 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddrV4;
-use std::path::PathBuf;
 use std::sync::mpsc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, Instant, sleep};
 mod cli;
 mod dht;
+mod logging;
 mod peer;
 mod peer_message;
 mod peer_orchestrator;
@@ -29,84 +31,58 @@ mod tracker;
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
-    let number = read_input_choice();
-    let info_hash: [u8; 20];
-    let peer_id: [u8; 20];
-    let torrent: Torrent;
-    let download_path: PathBuf;
-    let mut discovered_peers: HashSet<SocketAddrV4>;
+    initialize_logging();
+    log::info!("Starting BitTorrent client");
     let listener = TcpListener::bind("0.0.0.0:0").await.map_err(|err| err.to_string())?;
     let port = listener.local_addr().map_err(|err| err.to_string())?.port();
 
-    if number == 1 {
-        let input = read_magnet_url();
-        download_path = read_download_path();
-        let magnet = parse_magnet(&input).expect("Magnet link was already validated");
-
-        info_hash = magnet.info_hash;
-        peer_id = generate_id();
-        discovered_peers = HashSet::new();
-        match announce_and_get_peers_dht(info_hash).await {
-            Ok(dht_peers) => discovered_peers.extend(dht_peers),
-            Err(_) => {}
+    log::debug!("Tracker announce port: {port}");
+    let torrent_path_string = read_torrent_path();
+    let download_path = read_download_path();
+    let bytes = fs::read(torrent_path_string.trim()).expect("Failed to read the torrent file");
+    let torrent = match torrent_from_bytes(&bytes) {
+        Ok(torrent) => torrent,
+        Err(err) => {
+            log::error!("Failed to parse torrent metadata: {err}");
+            return Ok(());
         }
-
-        torrent = crate::torrent::get_torrent_from_magnet(&magnet, &discovered_peers).await.expect("Failed to fetch magnet metadata");
-        return Ok(());
-    } else {
-        let torrent_path_string = read_torrent_path();
-        download_path = read_download_path();
-        let bytes = fs::read(torrent_path_string.trim()).expect("Failed to read the torrent file");
-        torrent = match torrent_from_bytes(&bytes) {
-            Ok(torrent) => torrent,
-            Err(_) => {
-                return Ok(());
-            }
-        };
-
-        let info_bytes = get_info_bytes(&bytes).expect("Failed to extract the info dictionary");
-
-        let mut hasher = Sha1::new();
-        hasher.update(info_bytes);
-
-        info_hash = hasher.finalize().into();
-        peer_id = generate_id();
-
-        let single_file = match &torrent.info {
-            Info::SingleFile(file) => file,
-            Info::MultiFile(_) => {
-                return Ok(());
-            }
-        };
-
-        let mut announce: Option<Vec<Vec<String>>> = None;
-
-        if let Some(torrent_announce) = &torrent.announce {
-            announce = Some(vec![vec![torrent_announce.clone()]]);
-        }
-
-        if !torrent.announce_list.is_empty() {
-            announce = Some(torrent.announce_list.clone());
-        }
-
-        discovered_peers = HashSet::new();
-        if let Some(announce) = announce {
-            match announce_and_get_peers(single_file.length, info_hash, peer_id, port, &announce).await {
-                Ok(peers) => discovered_peers = peers,
-                Err(_) => {}
-            }
-        }
-        match announce_and_get_peers_dht(info_hash).await {
-            Ok(dht_peers) => discovered_peers.extend(dht_peers),
-            Err(_) => {}
-        }
-    }
-
-    let single_file: &SingleFile = match &torrent.info {
-        Info::SingleFile(file) => file,
-        Info::MultiFile(_) => return Ok(()),
     };
 
+    let info_bytes = get_info_bytes(&bytes).expect("Failed to extract the info dictionary");
+    let mut hasher = Sha1::new();
+    hasher.update(info_bytes);
+    let info_hash: [u8; 20] = hasher.finalize().into();
+    let peer_id = generate_id();
+
+    let single_file = match &torrent.info {
+        Info::SingleFile(file) => file,
+        Info::MultiFile(_) => {
+            log::warn!("Multi-file downloads are not implemented");
+            return Ok(());
+        }
+    };
+
+    let mut announce: Option<Vec<Vec<String>>> = None;
+    if let Some(torrent_announce) = &torrent.announce {
+        announce = Some(vec![vec![torrent_announce.clone()]]);
+    }
+    if !torrent.announce_list.is_empty() {
+        announce = Some(torrent.announce_list.clone());
+    }
+
+    let mut discovered_peers = HashSet::new();
+    if let Some(announce) = announce {
+        match announce_and_get_peers(single_file.length, info_hash, peer_id, port, &announce).await {
+            Ok(peers) => discovered_peers = peers,
+            Err(err) => log::warn!("Tracker discovery failed: {err}"),
+        }
+    }
+    match announce_and_get_peers_dht(info_hash).await {
+        Ok(dht_peers) => discovered_peers.extend(dht_peers),
+        Err(err) => log::warn!("DHT discovery failed: {err}"),
+    }
+
+    log::info!("Peer discovery finished: {} unique peers", discovered_peers.len());
     let piece_length = single_file.piece_length as u32;
 
     let hidden = download_path.join(format!(".{}", single_file.name));
@@ -116,6 +92,7 @@ async fn main() -> Result<(), String> {
     let completed_visible_file_exists = completed_visible_path.try_exists().map_err(|err| err.to_string())?;
     let both_files_exist = hidden_file_exists && completed_visible_file_exists;
     if both_files_exist {
+        log::error!("Both incomplete and completed files exist");
         return Err("Both incomplete and completed files exist".to_string());
     }
 
@@ -125,10 +102,13 @@ async fn main() -> Result<(), String> {
 
     let mut file;
     if hidden_file_exists {
+        log::info!("Opening incomplete file for resume");
         file = file_options.open(&hidden).map_err(|err| err.to_string())?;
     } else if completed_visible_file_exists {
+        log::info!("Opening completed file for verification and seeding");
         file = file_options.open(&completed_visible_path).map_err(|err| err.to_string())?;
     } else {
+        log::info!("Creating incomplete file of {} bytes", single_file.length);
         file_options.create_new(true);
         file = file_options.open(&hidden).map_err(|err| err.to_string())?;
         file.set_len(single_file.length).map_err(|err| err.to_string())?;
@@ -137,6 +117,7 @@ async fn main() -> Result<(), String> {
     let file_metadata = file.metadata().map_err(|err| err.to_string())?;
     let file_size_matches_torrent = file_metadata.len() == single_file.length;
     if !file_size_matches_torrent {
+        log::error!("File size does not match torrent length");
         return Err("File size does not match the torrent".to_string());
     }
     file.seek(SeekFrom::Start(0)).map_err(|err| err.to_string())?;
@@ -145,9 +126,11 @@ async fn main() -> Result<(), String> {
     let mut pending = single_file.length;
     let piece_count = single_file.length.div_ceil(piece_length as u64) as usize;
     if single_file.pieces.len() != piece_count * 20 {
+        log::error!("Hash count does not match the expected piece count");
         return Err("Hash count does not match the expected piece count".to_string());
     }
 
+    log::info!("Verifying {piece_count} local pieces");
     let mut completed_pieces: Vec<bool> = Vec::with_capacity(piece_count);
     let mut index: usize = 0;
     while pending > 0 {
@@ -158,12 +141,13 @@ async fn main() -> Result<(), String> {
         let hash: [u8; 20] = Sha1::digest(slice).into();
         let is_equal = hash == single_file.pieces[index * 20..(index + 1) * 20];
         completed_pieces.push(is_equal);
+        log::trace!("Local piece {index}: verified={is_equal}");
         pending -= amount as u64;
 
         index += 1;
     }
 
-    let mut peer_tasks: HashMap<usize, PeerTask> = HashMap::with_capacity(PEERS_PER_TORRENT);
+    let mut peer_tasks: HashMap<usize, PeerTask> = HashMap::with_capacity(MAX_ACTIVE_PEERS);
     let mut peer_queue: VecDeque<SocketAddrV4> = VecDeque::new();
     for peer in discovered_peers {
         peer_queue.push_back(peer);
@@ -178,6 +162,7 @@ async fn main() -> Result<(), String> {
         }
     }
 
+    log::info!("Local verification finished: {}/{} pieces complete", verified_downloaded_pieces.len(), piece_count);
     let hidden_file_exists = hidden.try_exists().map_err(|err| err.to_string())?;
     let mut path;
     if hidden_file_exists {
@@ -192,9 +177,12 @@ async fn main() -> Result<(), String> {
     if should_make_file_visible {
         tokio::fs::rename(&hidden, &completed_visible_path).await.map_err(|err| err.to_string())?;
         path = completed_visible_path.clone();
+        log::info!("All local pieces verified; file is now visible");
     }
     let piece_length = single_file.piece_length;
     let mut next_peer_id = 0;
+    let mut last_progress_log = Instant::now();
+    log::info!("Starting peer coordination; active peer limit: {MAX_ACTIVE_PEERS}; simultaneous connection attempt limit: {MAX_CONNECTING_PEERS}");
 
     loop {
         try_start_pending_peer_connections(&peer_tasks, &mut new_peer_tasks, &mut peer_queue, &mut next_peer_id, info_hash, peer_id);
@@ -205,6 +193,7 @@ async fn main() -> Result<(), String> {
         for (&peer_id, task) in &peer_tasks {
             let worker_has_stopped = task.handle.is_finished();
             if worker_has_stopped {
+                log::debug!("Peer {peer_id}: worker has stopped");
                 peers_to_remove.push(peer_id);
             }
         }
@@ -221,6 +210,18 @@ async fn main() -> Result<(), String> {
             remove_peer(peer_id, &mut peer_tasks);
         }
 
+        if last_progress_log.elapsed() >= Duration::from_secs(1) {
+            let completed_count = verified_downloaded_pieces.len();
+            let progress;
+            if piece_count == 0 {
+                progress = 100.0;
+            } else {
+                progress = completed_count as f64 / piece_count as f64 * 100.0;
+            }
+            log::info!("Progress: {progress:.2}% ({completed_count}/{piece_count} pieces). Active: {}. Pending connections: {}. Queued: {}", peer_tasks.len(), new_peer_tasks.len(), peer_queue.len());
+            last_progress_log = Instant::now();
+        }
+
         let no_active_peers = peer_tasks.is_empty();
         let no_connections_in_progress = new_peer_tasks.is_empty();
         let no_queued_peers = peer_queue.is_empty();
@@ -228,13 +229,16 @@ async fn main() -> Result<(), String> {
         if no_peers_remaining {
             let all_pieces_completed = verified_downloaded_pieces.len() == piece_count;
             if all_pieces_completed {
+                log::info!("All pieces completed; no peers remain connected");
                 break;
             }
+            log::error!("Download cannot continue: no peers remain for missing pieces");
             return Err("No peers remain to complete the download".to_string());
         }
 
         sleep(Duration::from_millis(10)).await;
     }
 
+    log::info!("BitTorrent client stopped");
     Ok(())
 }

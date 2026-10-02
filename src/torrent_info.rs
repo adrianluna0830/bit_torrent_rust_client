@@ -22,6 +22,7 @@ pub(crate) fn get_info_length(info: &Info) -> u64 {
 }
 
 pub(crate) fn get_info_bytes(bytes: &[u8]) -> Result<&[u8], String> {
+    log::debug!("Extracting info dictionary from {} bytes of torrent metadata", bytes.len());
     if bytes.is_empty() {
         return Err("Torrent file is empty".to_string());
     }
@@ -46,7 +47,10 @@ pub(crate) fn get_info_bytes(bytes: &[u8]) -> Result<&[u8], String> {
             }
 
             return match info_range {
-                Some((start, end)) => Ok(&bytes[start..end]),
+                Some((start, end)) => {
+                    log::debug!("Info dictionary found: {} bytes", end - start);
+                    Ok(&bytes[start..end])
+                }
                 None => Err("Root dictionary is missing the info key".to_string()),
             };
         }

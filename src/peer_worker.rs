@@ -43,6 +43,7 @@ pub(crate) async fn peer_worker(
     mut file: File,
     initial_verified_downloaded_pieces: HashSet<usize>,
 ) {
+    log::info!("Peer {peer_id}: worker started");
     let mut verified_downloaded_pieces = initial_verified_downloaded_pieces;
     let mut read_buffer = Vec::new();
     let mut notify_event: Option<usize> = None;
@@ -62,20 +63,25 @@ pub(crate) async fn peer_worker(
             let message = PeerMessage::Bitfield(bitfield).to_bytes();
             if let Err(err) = stream.write_all(&message).await {
                 let failure = PeerFailure { peer_id, reason: format!("Failed to send Bitfield: {err}") };
+                log::warn!("Peer {peer_id}: {}", failure.reason);
                 let _ = event_tx.send(PeerWorkerEvent::PeerFailedEvent(failure));
                 return;
             }
+            log::debug!("Peer {peer_id}: sent Bitfield with {} verified pieces", verified_downloaded_pieces.len());
             has_sended_bitfield = true;
         }
 
         match command_rx.try_recv() {
             Ok(command) => match command {
                 PeerOrchestratorCommand::NewPieceCommand(piece) => {
+                    log::debug!("Peer {peer_id}: received NewPieceCommand for piece {piece}");
                     verified_downloaded_pieces.insert(piece);
                     notify_event = Some(piece);
                 }
                 PeerOrchestratorCommand::PieceAssignmentCommand(new_piece_assignment) => {
+                    log::debug!("Peer {peer_id}: assigned piece {} with {} blocks", new_piece_assignment.piece, new_piece_assignment.blocks_to_download.len());
                     if piece_assignment.is_some() {
+                        log::error!("Peer {peer_id}: received an assignment while already downloading a piece");
                         panic!("Peer {peer_id} already has an assigned piece");
                     }
                     piece_assignment = Some(new_piece_assignment);
@@ -83,6 +89,7 @@ pub(crate) async fn peer_worker(
             },
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
+                log::info!("Peer {peer_id}: command channel closed, worker stopping");
                 return;
             }
         }
@@ -91,9 +98,11 @@ pub(crate) async fn peer_worker(
             let message = PeerMessage::Have(piece as u32).to_bytes();
             if let Err(err) = stream.write_all(&message).await {
                 let failure = PeerFailure { peer_id, reason: format!("Failed to send Have: {err}") };
+                log::warn!("Peer {peer_id}: {}", failure.reason);
                 let _ = event_tx.send(PeerWorkerEvent::PeerFailedEvent(failure));
                 return;
             }
+            log::debug!("Peer {peer_id}: sent Have for piece {piece}");
             notify_event = None;
         }
 
@@ -102,6 +111,7 @@ pub(crate) async fn peer_worker(
             && last_progress.elapsed() >= PIECE_PROGRESS_TIMEOUT
         {
             let failure = PeerFailure { peer_id, reason: "No progress on the assigned piece".to_string() };
+            log::warn!("Peer {peer_id}: {}", failure.reason);
             let _ = event_tx.send(PeerWorkerEvent::PeerFailedEvent(failure));
             return;
         }
@@ -110,6 +120,7 @@ pub(crate) async fn peer_worker(
             && has_expired_request(&assignment.blocks_to_download)
         {
             let failure = PeerFailure { peer_id, reason: "Block request timed out".to_string() };
+            log::warn!("Peer {peer_id}: {}", failure.reason);
             let _ = event_tx.send(PeerWorkerEvent::PeerFailedEvent(failure));
             return;
         }
@@ -118,16 +129,31 @@ pub(crate) async fn peer_worker(
             Ok(message) => message,
             Err(reason) => {
                 let failure = PeerFailure { peer_id, reason };
+                log::warn!("Peer {peer_id}: {}", failure.reason);
                 let _ = event_tx.send(PeerWorkerEvent::PeerFailedEvent(failure));
                 return;
             }
         };
         let no_message_received = message_received.is_none();
+        if let Some(message) = &message_received {
+            log::debug!("Peer {peer_id}: received {message}");
+        }
 
         match message_received {
             None | Some(PeerMessage::KeepAlive) => {}
             Some(PeerMessage::Choke) => {
                 peer_choked = true;
+
+                if let Some(assignment) = &mut piece_assignment {
+                    for block in &mut assignment.blocks_to_download {
+                        if block.state != BlockState::Pending {
+                            continue;
+                        }
+
+                        block.state = BlockState::NotRequested;
+                        block.requested_at = None;
+                    }
+                }
             }
             Some(PeerMessage::Unchoke) => {
                 peer_choked = false;
@@ -138,15 +164,18 @@ pub(crate) async fn peer_worker(
                 if let Err(err) = stream.write_all(&message).await {
                     let failure = PeerFailure { peer_id, reason: format!("Failed to send Unchoke: {err}") };
 
+                    log::warn!("Peer {peer_id}: {}", failure.reason);
                     let _ = event_tx.send(PeerWorkerEvent::PeerFailedEvent(failure));
 
                     return;
                 }
+                log::debug!("Peer {peer_id}: sent Unchoke");
             }
             Some(PeerMessage::NotInterested) => {}
             Some(PeerMessage::Have(piece)) => {
                 let pieces = HashSet::from([piece as usize]);
                 if event_tx.send(PeerWorkerEvent::AvailablePiecesEvent(AvailablePiecesEvent { pieces, peer_id })).is_err() {
+                    log::warn!("Peer {peer_id}: orchestrator event channel closed");
                     return;
                 }
             }
@@ -160,12 +189,15 @@ pub(crate) async fn peer_worker(
                         }
                     }
                 }
+                log::debug!("Peer {peer_id}: decoded Bitfield with {} available pieces", pieces.len());
                 if event_tx.send(PeerWorkerEvent::AvailablePiecesEvent(AvailablePiecesEvent { pieces, peer_id })).is_err() {
+                    log::warn!("Peer {peer_id}: orchestrator event channel closed");
                     return;
                 }
             }
             Some(PeerMessage::Request { index, begin, length }) => {
                 if !verified_downloaded_pieces.contains(&(index as usize)) {
+                    log::debug!("Peer {peer_id}: ignored Request for unavailable piece {index}");
                     continue;
                 }
 
@@ -175,6 +207,7 @@ pub(crate) async fn peer_worker(
                 let block_exceeds_piece = block_end > piece_length;
                 let request_is_invalid = block_is_empty || block_is_too_large || block_exceeds_piece;
                 if request_is_invalid {
+                    log::warn!("Peer {peer_id}: ignored invalid Request for piece {index}, offset {begin}, length {length}");
                     continue;
                 }
 
@@ -185,6 +218,7 @@ pub(crate) async fn peer_worker(
                     let requested_end = offset + u64::from(length);
                     let request_exceeds_file = requested_end > file_metadata.len();
                     if request_exceeds_file {
+                        log::warn!("Peer {peer_id}: ignored Request beyond the end of the file");
                         return Ok(());
                     }
 
@@ -194,6 +228,7 @@ pub(crate) async fn peer_worker(
 
                     let response = PeerMessage::Piece { index, begin, block };
                     stream.write_all(&response.to_bytes()).await?;
+                    log::debug!("Peer {peer_id}: sent {response}");
                     Ok(())
                 }
                 .await;
@@ -201,6 +236,7 @@ pub(crate) async fn peer_worker(
                 if let Err(err) = result {
                     let failure = PeerFailure { peer_id, reason: format!("Failed to serve block request: {err}") };
 
+                    log::warn!("Peer {peer_id}: {}", failure.reason);
                     let _ = event_tx.send(PeerWorkerEvent::PeerFailedEvent(failure));
 
                     return;
@@ -209,6 +245,7 @@ pub(crate) async fn peer_worker(
             Some(PeerMessage::Piece { index, begin, block }) => {
                 if let Some(assignmeent) = &mut piece_assignment {
                     if index != assignmeent.piece as u32 {
+                        log::error!("Peer {peer_id}: received piece {index}, expected {}", assignmeent.piece);
                         panic!("Peer {peer_id} sent piece {index} instead of its assigned piece");
                     }
                     let Some(expected_block) = assignmeent.blocks_to_download.iter_mut().find(|expected| expected.begin == begin) else {
@@ -218,6 +255,7 @@ pub(crate) async fn peer_worker(
                     let block_size_matches = block.len() == expected_block.length as usize;
                     let should_ignore_block = block_already_received || !block_size_matches;
                     if should_ignore_block {
+                        log::debug!("Peer {peer_id}: ignored duplicate or wrong-size block for piece {index}, offset {begin}");
                         continue;
                     }
                     let offset = assignmeent.piece as u64 * piece_length;
@@ -227,6 +265,7 @@ pub(crate) async fn peer_worker(
                     expected_block.state = BlockState::Received;
                     expected_block.requested_at = None;
                     assignmeent.last_progress_at = Instant::now();
+                    log::trace!("Peer {peer_id}: saved block for piece {index}, offset {begin}, length {}", block.len());
 
                     if assignmeent.all_blocks_received() {
                         let mut piece_size = 0;
@@ -243,14 +282,17 @@ pub(crate) async fn peer_worker(
 
                         if hash != assignmeent.piece_hash {
                             let reason = format!("Piece {} hash does not match the expected hash", assignmeent.piece);
+                            log::error!("Peer {peer_id}: {reason}");
                             let _ = event_tx.send(PeerWorkerEvent::PeerFailedEvent(PeerFailure { peer_id, reason }));
                             return;
                         }
 
                         let piece = assignmeent.piece;
                         if event_tx.send(PeerWorkerEvent::PieceSuccessfullyCompletedEvent(piece)).is_err() {
+                            log::warn!("Peer {peer_id}: orchestrator event channel closed");
                             return;
                         }
+                        log::info!("Peer {peer_id}: piece {piece} completed and verified");
                         verified_downloaded_pieces.insert(piece);
                         piece_assignment = None;
                     }
@@ -267,9 +309,11 @@ pub(crate) async fn peer_worker(
             let message = PeerMessage::Interested.to_bytes();
             if let Err(err) = stream.write_all(&message).await {
                 let failure = PeerFailure { peer_id, reason: format!("Failed to send Interested: {err}") };
+                log::warn!("Peer {peer_id}: {}", failure.reason);
                 let _ = event_tx.send(PeerWorkerEvent::PeerFailedEvent(failure));
                 return;
             }
+            log::debug!("Peer {peer_id}: sent Interested");
             has_sended_interested = true;
         }
         previous_piece = current_piece;
@@ -291,10 +335,12 @@ pub(crate) async fn peer_worker(
                     let request = PeerMessage::Request { index, begin: block.begin, length: block.length }.to_bytes();
                     if let Err(err) = stream.write_all(&request).await {
                         let failure = PeerFailure { peer_id, reason: format!("Failed to send block request: {err}") };
+                        log::warn!("Peer {peer_id}: {}", failure.reason);
                         let _ = event_tx.send(PeerWorkerEvent::PeerFailedEvent(failure));
                         return;
                     }
 
+                    log::debug!("Peer {peer_id}: sent Request for piece {index}, offset {}, length {}", block.begin, block.length);
                     block.state = BlockState::Pending;
                     block.requested_at = Some(Instant::now());
                     pending_requests += 1;

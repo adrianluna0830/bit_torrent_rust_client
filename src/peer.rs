@@ -8,6 +8,7 @@ pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const BLOCK_SIZE: u32 = 16_384;
 
 pub(crate) async fn get_peer_stream(peer: SocketAddrV4, info_hash: [u8; 20], peer_id: [u8; 20]) -> Result<TcpStream, String> {
+    log::debug!("Peer {peer}: TCP connection started");
     let connection_attempt = TcpStream::connect(peer);
     let connection_result = timeout(Duration::from_secs(15), connection_attempt).await;
     let connection = match connection_result {
@@ -16,9 +17,11 @@ pub(crate) async fn get_peer_stream(peer: SocketAddrV4, info_hash: [u8; 20], pee
     };
     let mut stream = connection.map_err(|err| format!("Failed to connect to peer: {err}"))?;
 
+    log::debug!("Peer {peer}: TCP connection established");
     let handshake_bytes = build_handshake(info_hash, peer_id);
     stream.write_all(&handshake_bytes).await.map_err(|err| format!("Failed to send handshake: {err}"))?;
 
+    log::debug!("Peer {peer}: sent handshake");
     let mut buf = [0u8; 68];
     let handshake_result = timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut buf)).await;
     let read_result = match handshake_result {
@@ -27,8 +30,10 @@ pub(crate) async fn get_peer_stream(peer: SocketAddrV4, info_hash: [u8; 20], pee
     };
     read_result.map_err(|err| format!("Failed to read handshake: {err}"))?;
 
+    log::debug!("Peer {peer}: received handshake");
     validate_peer_handshake(&buf, &info_hash).map_err(|err| format!("Invalid handshake: {err}"))?;
 
+    log::debug!("Peer {peer}: handshake validated");
     Ok(stream)
 }
 

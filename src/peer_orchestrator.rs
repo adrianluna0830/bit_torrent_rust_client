@@ -10,7 +10,8 @@ use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-pub(crate) const PEERS_PER_TORRENT: usize = 8;
+pub(crate) const MAX_ACTIVE_PEERS: usize = 8;
+pub(crate) const MAX_CONNECTING_PEERS: usize = 16;
 
 pub(crate) struct PeerTask {
     pub(crate) command_tx: mpsc::Sender<PeerOrchestratorCommand>,
@@ -62,20 +63,24 @@ pub(crate) fn try_start_pending_peer_connections(
     info_hash: [u8; 20],
     peer_id: [u8; 20],
 ) {
-    let total_peer_tasks = peer_tasks.len() + new_peer_tasks.len();
-    if total_peer_tasks < PEERS_PER_TORRENT {
-        let pending_amount = PEERS_PER_TORRENT - total_peer_tasks;
-        for _ in 0..pending_amount {
-            let Some(new_peer) = peer_queue.pop_front() else {
-                break;
-            };
-            let worker_peer_id = *next_peer_id;
-            *next_peer_id += 1;
-            new_peer_tasks.spawn(async move {
-                let stream = get_peer_stream(new_peer, info_hash, peer_id).await.map_err(|err| format!("Peer {worker_peer_id} ({new_peer}): {err}"))?;
-                Ok((stream, worker_peer_id))
-            });
-        }
+    let active_limit_reached = peer_tasks.len() >= MAX_ACTIVE_PEERS;
+    let connecting_limit_reached = new_peer_tasks.len() >= MAX_CONNECTING_PEERS;
+    if active_limit_reached || connecting_limit_reached {
+        return;
+    }
+
+    let pending_amount = MAX_CONNECTING_PEERS - new_peer_tasks.len();
+    for _ in 0..pending_amount {
+        let Some(new_peer) = peer_queue.pop_front() else {
+            break;
+        };
+        let worker_peer_id = *next_peer_id;
+        *next_peer_id += 1;
+        log::info!("Peer {worker_peer_id}: connecting to {new_peer}");
+        new_peer_tasks.spawn(async move {
+            let stream = get_peer_stream(new_peer, info_hash, peer_id).await.map_err(|err| format!("Peer {worker_peer_id} ({new_peer}): {err}"))?;
+            Ok((stream, worker_peer_id))
+        });
     }
 }
 
@@ -88,16 +93,22 @@ pub(crate) fn start_workers_for_new_connected_peers(
     piece_count: usize,
     verified_downloaded_pieces: &HashSet<usize>,
 ) -> Result<(), String> {
-    while let Some(result) = new_peer_tasks.try_join_next() {
+    while peer_tasks.len() < MAX_ACTIVE_PEERS {
+        let Some(result) = new_peer_tasks.try_join_next() else {
+            break;
+        };
         let (mut stream, worker_peer_id) = match result {
             Ok(Ok(peer)) => peer,
-            Ok(Err(_)) => {
+            Ok(Err(err)) => {
+                log::warn!("Connection failed: {err}");
                 continue;
             }
-            Err(_) => {
+            Err(err) => {
+                log::error!("Connection task failed: {err}");
                 continue;
             }
         };
+        log::debug!("Peer {worker_peer_id}: handshake accepted, preparing worker");
         let (command_tx, command_rx) = mpsc::channel::<PeerOrchestratorCommand>();
         let event_tx_del_peer = event_tx.clone();
         let mut worker_file_options = OpenOptions::new();
@@ -110,6 +121,7 @@ pub(crate) fn start_workers_for_new_connected_peers(
             peer_worker(&mut stream, command_rx, event_tx_del_peer, worker_peer_id, piece_length, BLOCK_SIZE, piece_count, worker_file, verified_downloaded_pieces).await;
         });
         peer_tasks.insert(worker_peer_id, PeerTask { command_tx, handle, piece_index_downloading: None, available_pieces: HashSet::new() });
+        log::info!("Peer {worker_peer_id}: connected; {} active peers", peer_tasks.len());
     }
 
     Ok(())
@@ -129,6 +141,7 @@ pub(crate) async fn process_peer_worker_events(
     while let Ok(event) = event_rx.try_recv() {
         match event {
             PeerWorkerEvent::AvailablePiecesEvent(available) => {
+                log::debug!("Peer {}: AvailablePiecesEvent with {} pieces", available.peer_id, available.pieces.len());
                 let Some(task) = peer_tasks.get_mut(&available.peer_id) else {
                     continue;
                 };
@@ -136,12 +149,15 @@ pub(crate) async fn process_peer_worker_events(
                     let piece_index_is_valid = piece_index < piece_count;
                     if piece_index_is_valid {
                         task.available_pieces.insert(piece_index);
+                    } else {
+                        log::warn!("Peer {}: ignored out-of-range piece {piece_index}", available.peer_id);
                     }
                 }
             }
             PeerWorkerEvent::PieceSuccessfullyCompletedEvent(piece_index) => {
                 completed_pieces[piece_index] = true;
                 verified_downloaded_pieces.insert(piece_index);
+                log::debug!("Piece {piece_index}: completion event processed");
 
                 let all_pieces_completed = verified_downloaded_pieces.len() == piece_count;
                 let file_is_hidden = path.as_path() == hidden;
@@ -149,6 +165,7 @@ pub(crate) async fn process_peer_worker_events(
                 if should_make_file_visible {
                     tokio::fs::rename(hidden, completed_visible_path).await.map_err(|err| err.to_string())?;
                     *path = completed_visible_path.to_path_buf();
+                    log::info!("Download complete; file is now visible and connected peers can keep downloading from us");
                 }
 
                 for (&peer_id, task) in peer_tasks.iter_mut() {
@@ -156,11 +173,13 @@ pub(crate) async fn process_peer_worker_events(
                         task.piece_index_downloading = None;
                     }
                     if task.command_tx.send(PeerOrchestratorCommand::NewPieceCommand(piece_index)).is_err() {
+                        log::warn!("Peer {peer_id}: worker no longer accepts new-piece notifications");
                         peers_to_remove.push(peer_id);
                     }
                 }
             }
             PeerWorkerEvent::PeerFailedEvent(failure) => {
+                log::debug!("Peer {}: failure event processed: {}", failure.peer_id, failure.reason);
                 remove_peer(failure.peer_id, peer_tasks);
             }
         }
@@ -198,7 +217,9 @@ pub(crate) fn assign_pieces_to_idle_workers(peer_tasks: &mut HashMap<usize, Peer
             continue;
         };
         let assignment = create_piece_assignment(piece_index, single_file);
+        log::debug!("Peer {peer_id}: sending assignment for piece {piece_index}, {} blocks", assignment.blocks_to_download.len());
         if task.command_tx.send(PeerOrchestratorCommand::PieceAssignmentCommand(assignment)).is_err() {
+            log::warn!("Peer {peer_id}: worker no longer accepts assignments");
             peers_to_remove.push(peer_id);
             continue;
         }
@@ -211,5 +232,9 @@ pub(crate) fn assign_pieces_to_idle_workers(peer_tasks: &mut HashMap<usize, Peer
 pub(crate) fn remove_peer(peer_id: usize, peer_tasks: &mut HashMap<usize, PeerTask>) {
     if let Some(task) = peer_tasks.remove(&peer_id) {
         task.handle.abort();
+        if let Some(piece_index) = task.piece_index_downloading {
+            log::info!("Piece {piece_index}: released for reassignment");
+        }
+        log::info!("Peer {peer_id}: worker removed; {} active peers", peer_tasks.len());
     }
 }

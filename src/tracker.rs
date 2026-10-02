@@ -55,6 +55,7 @@ pub(crate) async fn announce_to_tracker(url: &str) -> Result<Vec<u8>, String> {
     let response = reqwest::get(url).await.map_err(|error| error.to_string())?;
 
     let status = response.status();
+    log::debug!("HTTP tracker returned status {status}");
 
     let bytes = response.bytes().await.map_err(|error| error.to_string())?;
 
@@ -125,6 +126,7 @@ pub(crate) fn build_initial_tracker_request(info_hash: [u8; 20], peer_id: [u8; 2
 }
 
 pub(crate) fn parse_compact_peers(bytes: &[u8]) -> Result<HashSet<SocketAddrV4>, String> {
+    log::trace!("Decoding compact peer list: {} bytes", bytes.len());
     if bytes.len() % 6 != 0 {
         return Err("Compact peer list has an invalid length".to_string());
     }
@@ -137,6 +139,7 @@ pub(crate) fn parse_compact_peers(bytes: &[u8]) -> Result<HashSet<SocketAddrV4>,
         let dir = SocketAddrV4::new(ip, port);
         socket_addresses.insert(dir);
     }
+    log::debug!("Decoded {} peer addresses", socket_addresses.len());
     Ok(socket_addresses)
 }
 
@@ -148,12 +151,14 @@ async fn receive_udp_response(socket: &UdpSocket, tracker_addr: SocketAddrV4, tr
         let response_has_header = size >= 8;
         let should_ignore_response = !response_from_expected_tracker || !response_has_header;
         if should_ignore_response {
+            log::trace!("UDP tracker {tracker_addr}: ignored response from {sender}, size {size}");
             continue;
         }
 
         let received_id = u32::from_be_bytes(buffer[4..8].try_into().unwrap());
 
         if received_id == transaction_id {
+            log::debug!("UDP tracker {tracker_addr}: received response for transaction {received_id}, size {size}");
             return Ok(size);
         }
     }
@@ -184,6 +189,7 @@ async fn get_peers_from_udp(announce: &str, info_hash: [u8; 20], peer_id: [u8; 2
     connect_packet[12..16].copy_from_slice(&connect_transaction_id.to_be_bytes());
     let mut connect_response = [0u8; 2048];
     socket.send_to(&connect_packet, tracker_addr).await.map_err(|err| err.to_string())?;
+    log::debug!("UDP tracker {tracker_addr}: sent connection request, transaction {connect_transaction_id}");
 
     let connect_size = match timeout(Duration::from_secs(10), receive_udp_response(&socket, tracker_addr, connect_transaction_id, &mut connect_response)).await {
         Ok(Ok(size)) => size,
@@ -219,6 +225,7 @@ async fn get_peers_from_udp(announce: &str, info_hash: [u8; 20], peer_id: [u8; 2
     announce_packet.extend_from_slice(&port.to_be_bytes());
     let mut announce_response = vec![0u8; 65_535];
     socket.send_to(&announce_packet, tracker_addr).await.map_err(|err| err.to_string())?;
+    log::debug!("UDP tracker {tracker_addr}: sent announce request, transaction {announce_transaction_id}");
 
     let announce_size = match timeout(Duration::from_secs(10), receive_udp_response(&socket, tracker_addr, announce_transaction_id, &mut announce_response)).await {
         Ok(Ok(size)) => size,
@@ -239,20 +246,29 @@ async fn get_peers_from_udp(announce: &str, info_hash: [u8; 20], peer_id: [u8; 2
 }
 
 pub(crate) async fn announce_and_get_peers(length: u64, info_hash: [u8; 20], peer_id: [u8; 20], port: u16, announces: &[Vec<String>]) -> Result<HashSet<SocketAddrV4>, String> {
+    log::info!("Tracker discovery started: {} tiers", announces.len());
     let mut peers = HashSet::new();
     let mut had_valid_response = false;
     let tracker_request = build_initial_tracker_request(info_hash, peer_id, port, length);
 
     for tier in announces {
         for announce in tier {
+            let tracker_name;
+            match Url::parse(announce) {
+                Ok(url) => tracker_name = url.host_str().unwrap_or("unknown host").to_string(),
+                Err(_) => tracker_name = "invalid URL".to_string(),
+            }
+            log::debug!("Querying tracker {tracker_name}");
             if announce.starts_with("udp://") {
                 let parsed_peers = match get_peers_from_udp(announce, info_hash, peer_id, port, length).await {
                     Ok(parsed_peers) => parsed_peers,
-                    Err(_) => {
+                    Err(err) => {
+                        log::warn!("UDP tracker {tracker_name} failed: {err}");
                         continue;
                     }
                 };
 
+                log::info!("UDP tracker {tracker_name}: {} peers returned", parsed_peers.len());
                 had_valid_response = true;
                 peers.extend(parsed_peers);
                 continue;
@@ -262,32 +278,44 @@ pub(crate) async fn announce_and_get_peers(length: u64, info_hash: [u8; 20], pee
             let uses_https = announce.starts_with("https://");
             let tracker_protocol_supported = uses_http || uses_https;
             if !tracker_protocol_supported {
+                log::warn!("Tracker {tracker_name}: unsupported protocol");
                 continue;
             }
             let url = build_url(announce, &tracker_request);
+            log::debug!("HTTP tracker {tracker_name}: sending announce request");
             let response_bytes = match timeout(TRACKER_TIMEOUT, announce_to_tracker(&url)).await {
                 Ok(Ok(response)) => response,
-                Ok(Err(_)) => {
+                Ok(Err(err)) => {
+                    log::warn!("HTTP tracker {tracker_name} failed: {err}");
                     continue;
                 }
                 Err(_) => {
+                    log::warn!("HTTP tracker {tracker_name}: announce timed out");
                     continue;
                 }
             };
             let Ok(tracker_response) = serde_bencode::from_bytes::<TrackerResponse>(&response_bytes) else {
+                log::warn!("HTTP tracker {tracker_name}: invalid response");
                 continue;
             };
+            if let Some(interval) = tracker_response.interval {
+                log::debug!("HTTP tracker {tracker_name}: announce interval {interval} seconds");
+            }
             let Some(peers_bytes) = tracker_response.peers else {
+                log::warn!("HTTP tracker {tracker_name}: response contains no peers");
                 continue;
             };
             let Ok(parsed_peers) = parse_compact_peers(peers_bytes.as_ref()) else {
+                log::warn!("HTTP tracker {tracker_name}: invalid peer list");
                 continue;
             };
 
+            log::info!("HTTP tracker {tracker_name}: {} peers returned", parsed_peers.len());
             had_valid_response = true;
             peers.extend(parsed_peers);
         }
     }
 
+    log::info!("Tracker discovery finished: {} unique peers", peers.len());
     if had_valid_response { Ok(peers) } else { Err("No tracker returned a valid response".into()) }
 }

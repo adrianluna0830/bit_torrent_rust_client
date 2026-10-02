@@ -13,6 +13,7 @@ const MAX_QUERIED_NODES: usize = 100;
 const DHT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) async fn announce_and_get_peers_dht(info_hash: [u8; 20]) -> Result<HashSet<SocketAddrV4>, String> {
+    log::info!("DHT discovery started; resolving {HOST}");
     let addresses = tokio::net::lookup_host((HOST, HOST_PORT)).await.map_err(|err| err.to_string())?;
     let mut ipv4_address = None;
     for address in addresses {
@@ -33,6 +34,7 @@ pub(crate) async fn announce_and_get_peers_dht(info_hash: [u8; 20]) -> Result<Ha
 
     queried_nodes.insert(initial_address);
     let (initial_peers, initial_nodes) = query_node(initial_address, node_id, info_hash).await?;
+    log::debug!("DHT bootstrap {initial_address}: {} peers, {} nodes", initial_peers.len(), initial_nodes.len());
     found_peers.extend(initial_peers);
 
     for node in initial_nodes {
@@ -54,6 +56,7 @@ pub(crate) async fn announce_and_get_peers_dht(info_hash: [u8; 20]) -> Result<Ha
 
         match query_node(node.address, node_id, info_hash).await {
             Ok((peers, new_nodes)) => {
+                log::debug!("DHT node {}: {} peers, {} nodes", node.address, peers.len(), new_nodes.len());
                 found_peers.extend(peers);
 
                 for new_node in new_nodes {
@@ -62,12 +65,14 @@ pub(crate) async fn announce_and_get_peers_dht(info_hash: [u8; 20]) -> Result<Ha
                     }
                 }
             }
-            Err(_) => {
+            Err(err) => {
+                log::warn!("DHT node {} failed: {err}", node.address);
                 known_nodes.remove(&node.address);
             }
         }
     }
 
+    log::info!("DHT discovery finished: {} unique peers from {} nodes", found_peers.len(), queried_nodes.len());
     Ok(found_peers)
 }
 
@@ -115,6 +120,7 @@ async fn query_node(address: SocketAddrV4, node_id: [u8; 20], info_hash: [u8; 20
     let query = GetPeersQuery::new(node_id, info_hash);
     let bytes = serde_bencode::to_bytes(&query).map_err(|err| err.to_string())?;
     socket.send_to(&bytes, address).await.map_err(|err| err.to_string())?;
+    log::debug!("DHT node {address}: sent get_peers query");
 
     let mut buffer = vec![0u8; 4096];
     let response_result = timeout(DHT_RESPONSE_TIMEOUT, socket.recv_from(&mut buffer)).await;
@@ -128,6 +134,7 @@ async fn query_node(address: SocketAddrV4, node_id: [u8; 20], info_hash: [u8; 20
         return Err("DHT response came from a different node".to_string());
     }
 
+    log::debug!("DHT node {address}: received response, {received_bytes} bytes");
     let reply: GetPeersResponse = serde_bencode::from_bytes(&buffer[..received_bytes]).map_err(|error| error.to_string())?;
 
     if query.transaction_id.as_slice() != reply.transaction_id.as_ref() {
@@ -135,6 +142,7 @@ async fn query_node(address: SocketAddrV4, node_id: [u8; 20], info_hash: [u8; 20
     }
 
     if reply.message_type != "r" {
+        log::warn!("DHT node {address}: rejected query or returned an unexpected response type");
         return match reply.error {
             Some((code, _)) => Err(format!("DHT node reported error {code}")),
             None => Err("Unexpected DHT response type".to_string()),
@@ -176,6 +184,7 @@ fn parse_compact_nodes(bytes: &[u8]) -> Result<Vec<DhtNode>, String> {
         nodes.push(DhtNode { id, address: SocketAddrV4::new(ip, port) });
     }
 
+    log::trace!("Decoded {} DHT nodes", nodes.len());
     Ok(nodes)
 }
 
