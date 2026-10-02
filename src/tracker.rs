@@ -16,7 +16,7 @@ pub(crate) struct TrackerRequest {
     port: u16,
     uploaded: u64,
     downloaded: u64,
-    left: u64,
+    length: u64,
     compact: u8,
     event: Option<AnnounceEvent>,
     tracker_id: Option<String>,
@@ -59,7 +59,7 @@ pub(crate) async fn announce_to_tracker(url: &str) -> Result<Vec<u8>, String> {
     let bytes = response.bytes().await.map_err(|error| error.to_string())?;
 
     if !status.is_success() {
-        return Err(format!("el tracker respondio con http {status}"));
+        return Err(format!("Tracker returned HTTP {status}"));
     }
 
     Ok(bytes.to_vec())
@@ -80,7 +80,7 @@ pub(crate) fn build_url(announce: &str, tracker_request: &TrackerRequest) -> Str
 
     let mut url = format!(
         "{}{}info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}&compact={}",
-        announce, separator, info_hash, peer_id, tracker_request.port, tracker_request.uploaded, tracker_request.downloaded, tracker_request.left, tracker_request.compact,
+        announce, separator, info_hash, peer_id, tracker_request.port, tracker_request.uploaded, tracker_request.downloaded, tracker_request.length, tracker_request.compact,
     );
 
     if let Some(event) = &tracker_request.event {
@@ -121,12 +121,12 @@ pub(crate) fn generate_random_u32() -> u32 {
 }
 
 pub(crate) fn build_initial_tracker_request(info_hash: [u8; 20], peer_id: [u8; 20], port: u16, length: u64) -> TrackerRequest {
-    TrackerRequest { info_hash, peer_id, port, uploaded: 0, downloaded: 0, left: length, compact: 1, event: Some(AnnounceEvent::Started), tracker_id: None }
+    TrackerRequest { info_hash, peer_id, port, uploaded: 0, downloaded: 0, length, compact: 1, event: Some(AnnounceEvent::Started), tracker_id: None }
 }
 
 pub(crate) fn parse_compact_peers(bytes: &[u8]) -> Result<HashSet<SocketAddrV4>, String> {
     if bytes.len() % 6 != 0 {
-        return Err("compact peers no es multiplo de 6".to_string());
+        return Err("Compact peer list has an invalid length".to_string());
     }
 
     let mut socket_addresses = HashSet::new();
@@ -144,7 +144,10 @@ async fn receive_udp_response(socket: &UdpSocket, tracker_addr: SocketAddrV4, tr
     loop {
         let (size, sender) = socket.recv_from(buffer).await.map_err(|err| err.to_string())?;
 
-        if sender != SocketAddr::V4(tracker_addr) || size < 8 {
+        let response_from_expected_tracker = sender == SocketAddr::V4(tracker_addr);
+        let response_has_header = size >= 8;
+        let should_ignore_response = !response_from_expected_tracker || !response_has_header;
+        if should_ignore_response {
             continue;
         }
 
@@ -159,20 +162,20 @@ async fn receive_udp_response(socket: &UdpSocket, tracker_addr: SocketAddrV4, tr
 async fn get_peers_from_udp(announce: &str, info_hash: [u8; 20], peer_id: [u8; 20], port: u16, total_length: u64) -> Result<HashSet<SocketAddrV4>, String> {
     let url = Url::parse(announce).map_err(|err| err.to_string())?;
 
-    if url.scheme() != "udp" {
-        return Err("se esperaba una URL udp://".into());
+    let host = url.host_str().ok_or_else(|| "Tracker URL has no host".to_string())?;
+    let tracker_port = url.port().ok_or_else(|| "Tracker URL has no port".to_string())?;
+    let addresses = tokio::net::lookup_host((host, tracker_port)).await.map_err(|err| err.to_string())?;
+    let mut ipv4_address = None;
+    for address in addresses {
+        if let SocketAddr::V4(address) = address {
+            ipv4_address = Some(address);
+            break;
+        }
     }
-
-    let host = url.host_str().ok_or_else(|| "la URL no contiene un host".to_string())?;
-    let tracker_port = url.port().ok_or_else(|| "la URL no contiene un puerto".to_string())?;
-    let tracker_addr = tokio::net::lookup_host((host, tracker_port))
-        .await
-        .map_err(|err| err.to_string())?
-        .find_map(|addr| match addr {
-            SocketAddr::V4(addr) => Some(addr),
-            SocketAddr::V6(_) => None,
-        })
-        .ok_or_else(|| "el tracker no tiene dirección IPv4".to_string())?;
+    let tracker_addr = match ipv4_address {
+        Some(address) => address,
+        None => return Err("Tracker has no IPv4 address".to_string()),
+    };
     let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(|err| err.to_string())?;
     let connect_transaction_id = generate_random_u32();
     let mut connect_packet = [0u8; 16];
@@ -180,31 +183,21 @@ async fn get_peers_from_udp(announce: &str, info_hash: [u8; 20], peer_id: [u8; 2
     connect_packet[8..12].copy_from_slice(&0u32.to_be_bytes());
     connect_packet[12..16].copy_from_slice(&connect_transaction_id.to_be_bytes());
     let mut connect_response = [0u8; 2048];
-    let mut connect_size = None;
+    socket.send_to(&connect_packet, tracker_addr).await.map_err(|err| err.to_string())?;
 
-    for wait_seconds in [15, 30, 60] {
-        socket.send_to(&connect_packet, tracker_addr).await.map_err(|err| err.to_string())?;
-
-        match timeout(Duration::from_secs(wait_seconds), receive_udp_response(&socket, tracker_addr, connect_transaction_id, &mut connect_response)).await {
-            Ok(Ok(size)) => {
-                connect_size = Some(size);
-                break;
-            }
-            Ok(Err(err)) => return Err(err),
-            Err(_) => continue,
-        }
-    }
-
-    let connect_size = connect_size.ok_or_else(|| "el tracker no respondió al connect tras 3 intentos".to_string())?;
+    let connect_size = match timeout(Duration::from_secs(10), receive_udp_response(&socket, tracker_addr, connect_transaction_id, &mut connect_response)).await {
+        Ok(Ok(size)) => size,
+        Ok(Err(err)) => return Err(err),
+        Err(_) => return Err("UDP tracker connection timed out after 10 seconds".to_string()),
+    };
     let action = u32::from_be_bytes(connect_response[0..4].try_into().unwrap());
 
     if action == 3 {
-        let message = String::from_utf8_lossy(&connect_response[8..connect_size]);
-        return Err(format!("error del tracker en connect: {message}"));
+        return Err("UDP tracker rejected the connection".to_string());
     }
 
     if action != 0 || connect_size < 16 {
-        return Err("respuesta connect inválida".into());
+        return Err("Invalid UDP connection response".into());
     }
 
     let connection_id = u64::from_be_bytes(connect_response[8..16].try_into().unwrap());
@@ -225,31 +218,21 @@ async fn get_peers_from_udp(announce: &str, info_hash: [u8; 20], peer_id: [u8; 2
     announce_packet.extend_from_slice(&(-1i32).to_be_bytes());
     announce_packet.extend_from_slice(&port.to_be_bytes());
     let mut announce_response = vec![0u8; 65_535];
-    let mut announce_size = None;
+    socket.send_to(&announce_packet, tracker_addr).await.map_err(|err| err.to_string())?;
 
-    for wait_seconds in [15, 30, 60] {
-        socket.send_to(&announce_packet, tracker_addr).await.map_err(|err| err.to_string())?;
-
-        match timeout(Duration::from_secs(wait_seconds), receive_udp_response(&socket, tracker_addr, announce_transaction_id, &mut announce_response)).await {
-            Ok(Ok(size)) => {
-                announce_size = Some(size);
-                break;
-            }
-            Ok(Err(err)) => return Err(err),
-            Err(_) => continue,
-        }
-    }
-
-    let announce_size = announce_size.ok_or_else(|| "el tracker no respondió al announce tras 3 intentos".to_string())?;
+    let announce_size = match timeout(Duration::from_secs(10), receive_udp_response(&socket, tracker_addr, announce_transaction_id, &mut announce_response)).await {
+        Ok(Ok(size)) => size,
+        Ok(Err(err)) => return Err(err),
+        Err(_) => return Err("UDP tracker announce timed out after 10 seconds".to_string()),
+    };
     let action = u32::from_be_bytes(announce_response[0..4].try_into().unwrap());
 
     if action == 3 {
-        let message = String::from_utf8_lossy(&announce_response[8..announce_size]);
-        return Err(format!("error del tracker en announce: {message}"));
+        return Err("UDP tracker rejected the announce".to_string());
     }
 
     if action != 1 || announce_size < 20 {
-        return Err("respuesta announce inválida".into());
+        return Err("Invalid UDP announce response".into());
     }
 
     parse_compact_peers(&announce_response[20..announce_size])
@@ -263,8 +246,11 @@ pub(crate) async fn announce_and_get_peers(length: u64, info_hash: [u8; 20], pee
     for tier in announces {
         for announce in tier {
             if announce.starts_with("udp://") {
-                let Ok(parsed_peers) = get_peers_from_udp(announce, info_hash, peer_id, port, length).await else {
-                    continue;
+                let parsed_peers = match get_peers_from_udp(announce, info_hash, peer_id, port, length).await {
+                    Ok(parsed_peers) => parsed_peers,
+                    Err(_) => {
+                        continue;
+                    }
                 };
 
                 had_valid_response = true;
@@ -272,16 +258,21 @@ pub(crate) async fn announce_and_get_peers(length: u64, info_hash: [u8; 20], pee
                 continue;
             }
 
-            if !announce.starts_with("https://") && !announce.starts_with("http://") {
+            let uses_http = announce.starts_with("http://");
+            let uses_https = announce.starts_with("https://");
+            let tracker_protocol_supported = uses_http || uses_https;
+            if !tracker_protocol_supported {
                 continue;
             }
-
             let url = build_url(announce, &tracker_request);
-            let Ok(response) = timeout(TRACKER_TIMEOUT, announce_to_tracker(&url)).await else {
-                continue;
-            };
-            let Ok(response_bytes) = response else {
-                continue;
+            let response_bytes = match timeout(TRACKER_TIMEOUT, announce_to_tracker(&url)).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(_)) => {
+                    continue;
+                }
+                Err(_) => {
+                    continue;
+                }
             };
             let Ok(tracker_response) = serde_bencode::from_bytes::<TrackerResponse>(&response_bytes) else {
                 continue;
@@ -298,5 +289,5 @@ pub(crate) async fn announce_and_get_peers(length: u64, info_hash: [u8; 20], pee
         }
     }
 
-    if had_valid_response { Ok(peers) } else { Err("no se pudo consultar ningún tracker".into()) }
+    if had_valid_response { Ok(peers) } else { Err("No tracker returned a valid response".into()) }
 }

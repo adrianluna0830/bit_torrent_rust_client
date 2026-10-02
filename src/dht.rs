@@ -10,16 +10,21 @@ const HOST: &str = "dht.libtorrent.org";
 const HOST_PORT: u16 = 25401;
 const K: usize = 8;
 const MAX_QUERIED_NODES: usize = 100;
+const DHT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) async fn announce_and_get_peers_dht(info_hash: [u8; 20]) -> Result<HashSet<SocketAddrV4>, String> {
-    let initial_address = tokio::net::lookup_host((HOST, HOST_PORT))
-        .await
-        .map_err(|err| err.to_string())?
-        .find_map(|addr| match addr {
-            SocketAddr::V4(addr) => Some(addr),
-            SocketAddr::V6(_) => None,
-        })
-        .ok_or_else(|| "el nodo DHT inicial no tiene dirección IPv4".to_string())?;
+    let addresses = tokio::net::lookup_host((HOST, HOST_PORT)).await.map_err(|err| err.to_string())?;
+    let mut ipv4_address = None;
+    for address in addresses {
+        if let SocketAddr::V4(address) = address {
+            ipv4_address = Some(address);
+            break;
+        }
+    }
+    let initial_address = match ipv4_address {
+        Some(address) => address,
+        None => return Err("DHT bootstrap node has no IPv4 address".to_string()),
+    };
 
     let node_id = generate_id();
     let mut queried_nodes = HashSet::new();
@@ -27,7 +32,6 @@ pub(crate) async fn announce_and_get_peers_dht(info_hash: [u8; 20]) -> Result<Ha
     let mut found_peers = HashSet::new();
 
     queried_nodes.insert(initial_address);
-
     let (initial_peers, initial_nodes) = query_node(initial_address, node_id, info_hash).await?;
     found_peers.extend(initial_peers);
 
@@ -110,32 +114,35 @@ async fn query_node(address: SocketAddrV4, node_id: [u8; 20], info_hash: [u8; 20
     let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(|err| err.to_string())?;
     let query = GetPeersQuery::new(node_id, info_hash);
     let bytes = serde_bencode::to_bytes(&query).map_err(|err| err.to_string())?;
-
     socket.send_to(&bytes, address).await.map_err(|err| err.to_string())?;
 
     let mut buffer = vec![0u8; 4096];
-    let (received_bytes, sender) =
-        timeout(Duration::from_secs(10), socket.recv_from(&mut buffer)).await.map_err(|_| "se agotaron los 10 segundos esperando la respuesta DHT".to_string())?.map_err(|err| err.to_string())?;
+    let response_result = timeout(DHT_RESPONSE_TIMEOUT, socket.recv_from(&mut buffer)).await;
+    let read_result = match response_result {
+        Ok(result) => result,
+        Err(_) => return Err("DHT response timed out after 10 seconds".to_string()),
+    };
+    let (received_bytes, sender) = read_result.map_err(|err| err.to_string())?;
 
     if sender != SocketAddr::V4(address) {
-        return Err("la respuesta DHT llegó desde un nodo diferente al consultado".to_string());
+        return Err("DHT response came from a different node".to_string());
     }
 
     let reply: GetPeersResponse = serde_bencode::from_bytes(&buffer[..received_bytes]).map_err(|error| error.to_string())?;
 
     if query.transaction_id.as_slice() != reply.transaction_id.as_ref() {
-        return Err("el identificador de transacción de la respuesta DHT no coincide".to_string());
+        return Err("DHT response transaction ID does not match".to_string());
     }
 
     if reply.message_type != "r" {
         return match reply.error {
-            Some((code, message)) => Err(format!("el nodo DHT respondió con el error {code}: {message}")),
-            None => Err(format!("tipo de respuesta DHT inesperado: {}", reply.message_type)),
+            Some((code, _)) => Err(format!("DHT node reported error {code}")),
+            None => Err("Unexpected DHT response type".to_string()),
         };
     }
 
     let Some(response) = reply.response else {
-        return Err("la respuesta DHT no contiene el diccionario de respuesta".to_string());
+        return Err("DHT response is missing the response dictionary".to_string());
     };
 
     let mut found_peers = Vec::new();
@@ -156,7 +163,7 @@ async fn query_node(address: SocketAddrV4, node_id: [u8; 20], info_hash: [u8; 20
 
 fn parse_compact_nodes(bytes: &[u8]) -> Result<Vec<DhtNode>, String> {
     if bytes.len() % 26 != 0 {
-        return Err("la lista de nodos DHT tiene un tamaño inválido".to_string());
+        return Err("DHT node list has an invalid length".to_string());
     }
 
     let mut nodes = Vec::new();
@@ -230,7 +237,7 @@ struct GetPeersResponseData {
     #[serde(rename = "id")]
     node_id: ByteBuf,
 
-    token: ByteBuf,
+    token: Option<ByteBuf>,
     nodes: Option<ByteBuf>,
     values: Option<Vec<ByteBuf>>,
 }

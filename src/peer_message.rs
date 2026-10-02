@@ -1,3 +1,6 @@
+use std::io;
+use tokio::net::TcpStream;
+
 #[derive(Debug)]
 pub(crate) enum PeerMessage {
     KeepAlive,
@@ -54,7 +57,7 @@ impl PeerMessage {
             }
         };
 
-        let message_length = u32::try_from(1 + content.len()).expect("el mensaje del peer es demasiado grande");
+        let message_length = (1 + content.len()) as u32;
         let mut bytes = Vec::with_capacity(4 + message_length as usize);
 
         bytes.extend_from_slice(&message_length.to_be_bytes());
@@ -66,14 +69,14 @@ impl PeerMessage {
 
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         if bytes.len() < 4 {
-            return Err("el mensaje no contiene los 4 bytes de longitud".to_string());
+            return Err("Message is missing its length prefix".to_string());
         }
 
         let message_length = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
         let expected_length = 4 + message_length;
 
         if bytes.len() != expected_length {
-            return Err(format!("longitud incorrecta: se esperaban {expected_length} bytes, pero llegaron {}", bytes.len()));
+            return Err(format!("Invalid message length: expected {expected_length}, received {}", bytes.len()));
         }
 
         if message_length == 0 {
@@ -111,7 +114,7 @@ impl PeerMessage {
             }
             7 => {
                 if content.len() < 8 {
-                    return Err("el contenido de Piece debe tener al menos 8 bytes".to_string());
+                    return Err("Piece message is missing its block header".to_string());
                 }
 
                 Ok(Self::Piece { index: Self::read_u32(content, 0), begin: Self::read_u32(content, 4), block: content[8..].to_vec() })
@@ -120,19 +123,45 @@ impl PeerMessage {
                 Self::require_content_length(content, 12, "Cancel")?;
                 Ok(Self::Cancel { index: Self::read_u32(content, 0), begin: Self::read_u32(content, 4), length: Self::read_u32(content, 8) })
             }
-            id => Err(format!("identificador de mensaje desconocido: {id}")),
+            id => Err(format!("Unknown message ID: {id}")),
         }
     }
 
     fn require_content_length(content: &[u8], expected: usize, message_name: &str) -> Result<(), String> {
         if content.len() != expected {
-            return Err(format!("el contenido de {message_name} debe tener {expected} bytes, pero tiene {}", content.len()));
+            return Err(format!("Invalid {message_name} payload length: expected {expected}, received {}", content.len()));
         }
 
         Ok(())
     }
 
     fn read_u32(bytes: &[u8], start: usize) -> u32 {
-        u32::from_be_bytes(bytes[start..start + 4].try_into().unwrap())
+        let end = start + 4;
+        let number_bytes: [u8; 4] = bytes[start..end].try_into().unwrap();
+        u32::from_be_bytes(number_bytes)
+    }
+}
+
+pub(crate) fn try_read_peer_message(stream: &TcpStream, buffer: &mut Vec<u8>) -> Result<Option<PeerMessage>, String> {
+    let mut chunk = [0u8; 4096];
+
+    loop {
+        if buffer.len() >= 4 {
+            let length = u32::from_be_bytes(buffer[..4].try_into().unwrap()) as usize;
+            let total = 4 + length;
+
+            if buffer.len() >= total {
+                let message = PeerMessage::from_bytes(&buffer[..total])?;
+                buffer.drain(..total);
+                return Ok(Some(message));
+            }
+        }
+
+        match stream.try_read(&mut chunk) {
+            Ok(0) => return Err("Peer closed the connection".to_string()),
+            Ok(size) => buffer.extend_from_slice(&chunk[..size]),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(err) => return Err(err.to_string()),
+        }
     }
 }

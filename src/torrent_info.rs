@@ -11,17 +11,23 @@ enum BencodeFieldType {
 pub(crate) fn get_info_length(info: &Info) -> u64 {
     match info {
         Info::SingleFile(file) => file.length,
-        Info::MultiFile(info) => info.files.iter().map(|file| file.length).sum(),
+        Info::MultiFile(info) => {
+            let mut total_length = 0;
+            for file in &info.files {
+                total_length += file.length;
+            }
+            total_length
+        }
     }
 }
 
 pub(crate) fn get_info_bytes(bytes: &[u8]) -> Result<&[u8], String> {
     if bytes.is_empty() {
-        return Err("el archivo esta vacio".to_string());
+        return Err("Torrent file is empty".to_string());
     }
 
     if bytes[0] != b'd' {
-        return Err("el torrent no comienza con un diccionario bencode".to_string());
+        return Err("Torrent does not start with a bencoded dictionary".to_string());
     }
 
     let mut position: usize = 1;
@@ -29,19 +35,19 @@ pub(crate) fn get_info_bytes(bytes: &[u8]) -> Result<&[u8], String> {
 
     loop {
         if position >= bytes.len() {
-            return Err("el diccionario principal no tiene una 'e' final".to_string());
+            return Err("Root dictionary is missing its terminator".to_string());
         }
 
         if bytes[position] == b'e' {
             let position_after_dictionary = position + 1;
 
             if position_after_dictionary != bytes.len() {
-                return Err("hay bytes adicionales despues del diccionario principal".to_string());
+                return Err("Unexpected data after the root dictionary".to_string());
             }
 
             return match info_range {
                 Some((start, end)) => Ok(&bytes[start..end]),
-                None => Err("el diccionario principal no contiene la clave info".to_string()),
+                None => Err("Root dictionary is missing the info key".to_string()),
             };
         }
 
@@ -51,11 +57,11 @@ pub(crate) fn get_info_bytes(bytes: &[u8]) -> Result<&[u8], String> {
 
         if key == b"info" {
             if info_range.is_some() {
-                return Err("el torrent contiene mas de una clave info".to_string());
+                return Err("Torrent contains duplicate info keys".to_string());
             }
 
             if bytes.get(value_start) != Some(&b'd') {
-                return Err("el valor de info no es un diccionario".to_string());
+                return Err("Info value is not a dictionary".to_string());
             }
 
             info_range = Some((value_start, value_end));
@@ -71,12 +77,15 @@ fn get_bencode_field(byte: u8) -> Result<BencodeFieldType, String> {
         b'l' => Ok(BencodeFieldType::List),
         b'd' => Ok(BencodeFieldType::Dictionary),
         b'0'..=b'9' => Ok(BencodeFieldType::ByteString),
-        _ => Err(format!("byte bencode desconocido: {byte}")),
+        _ => Err("Unknown bencode token".to_string()),
     }
 }
 
 fn skip_bencode_field(position: usize, bytes: &[u8]) -> Result<usize, String> {
-    let byte = bytes.get(position).copied().ok_or_else(|| "se intento leer fuera del archivo".to_string())?;
+    let byte = match bytes.get(position) {
+        Some(&byte) => byte,
+        None => return Err("se intento leer fuera del archivo".to_string()),
+    };
 
     match get_bencode_field(byte)? {
         BencodeFieldType::Integer => skip_bencode_integer(position, bytes),
@@ -87,10 +96,13 @@ fn skip_bencode_field(position: usize, bytes: &[u8]) -> Result<usize, String> {
 }
 
 fn read_bencode_byte_string(bytes: &[u8], position: usize) -> Result<(&[u8], usize), String> {
-    let first_byte = bytes.get(position).copied().ok_or_else(|| "se esperaba una cadena, pero termino el archivo".to_string())?;
+    let first_byte = match bytes.get(position) {
+        Some(&byte) => byte,
+        None => return Err("se esperaba una cadena, pero termino el archivo".to_string()),
+    };
 
     if !first_byte.is_ascii_digit() {
-        return Err(format!("se esperaba la longitud de una cadena en la posicion {position}"));
+        return Err(format!("Expected a string length at position {position}"));
     }
 
     let mut cursor = position;
@@ -100,25 +112,25 @@ fn read_bencode_byte_string(bytes: &[u8], position: usize) -> Result<(&[u8], usi
         let byte = bytes[cursor];
 
         if !byte.is_ascii_digit() {
-            return Err(format!("longitud de cadena invalida en la posicion {cursor}"));
+            return Err(format!("Invalid string length at position {cursor}"));
         }
 
         let digit = (byte - b'0') as usize;
 
-        length = length.checked_mul(10).and_then(|value| value.checked_add(digit)).ok_or_else(|| "la longitud de la cadena es demasiado grande".to_string())?;
+        length = length * 10 + digit;
 
         cursor += 1;
     }
 
     if cursor >= bytes.len() {
-        return Err("no se encontro ':' despues de la longitud".to_string());
+        return Err("String length is missing its separator".to_string());
     }
 
     let content_start = cursor + 1;
-    let content_end = content_start.checked_add(length).ok_or_else(|| "la posicion final de la cadena es demasiado grande".to_string())?;
+    let content_end = content_start + length;
 
     if content_end > bytes.len() {
-        return Err("la cadena declara mas bytes de los disponibles".to_string());
+        return Err("String length exceeds the available data".to_string());
     }
 
     Ok((&bytes[content_start..content_end], content_end))
@@ -130,14 +142,10 @@ fn skip_bencode_byte_string(position: usize, bytes: &[u8]) -> Result<usize, Stri
 }
 
 fn skip_bencode_integer(position: usize, bytes: &[u8]) -> Result<usize, String> {
-    if bytes.get(position) != Some(&b'i') {
-        return Err(format!("se esperaba un entero en la posicion {position}"));
-    }
-
     let mut cursor = position + 1;
 
     if cursor >= bytes.len() {
-        return Err("el entero esta incompleto".to_string());
+        return Err("Integer is incomplete".to_string());
     }
 
     if bytes[cursor] == b'-' {
@@ -151,26 +159,23 @@ fn skip_bencode_integer(position: usize, bytes: &[u8]) -> Result<usize, String> 
     }
 
     if cursor == digits_start {
-        return Err(format!("el entero de la posicion {position} no contiene digitos"));
+        return Err(format!("Integer at position {position} contains no digits"));
     }
 
-    if cursor >= bytes.len() || bytes[cursor] != b'e' {
-        return Err(format!("el entero de la posicion {position} no termina con 'e'"));
+    let integer_has_terminator = cursor < bytes.len() && bytes[cursor] == b'e';
+    if !integer_has_terminator {
+        return Err(format!("Integer at position {position} is missing its terminator"));
     }
 
     Ok(cursor + 1)
 }
 
 fn skip_bencode_list(position: usize, bytes: &[u8]) -> Result<usize, String> {
-    if bytes.get(position) != Some(&b'l') {
-        return Err(format!("se esperaba una lista en la posicion {position}"));
-    }
-
     let mut cursor = position + 1;
 
     loop {
         if cursor >= bytes.len() {
-            return Err("la lista no tiene una 'e' final".to_string());
+            return Err("List is missing its terminator".to_string());
         }
 
         if bytes[cursor] == b'e' {
@@ -182,15 +187,11 @@ fn skip_bencode_list(position: usize, bytes: &[u8]) -> Result<usize, String> {
 }
 
 fn skip_bencode_dictionary(position: usize, bytes: &[u8]) -> Result<usize, String> {
-    if bytes.get(position) != Some(&b'd') {
-        return Err(format!("se esperaba un diccionario en la posicion {position}"));
-    }
-
     let mut cursor = position + 1;
 
     loop {
         if cursor >= bytes.len() {
-            return Err("el diccionario no tiene una 'e' final".to_string());
+            return Err("Dictionary is missing its terminator".to_string());
         }
 
         if bytes[cursor] == b'e' {
